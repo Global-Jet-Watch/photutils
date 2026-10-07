@@ -5,12 +5,10 @@ and King (2000; PASP 112, 1360) and Anderson (2016; WFC3 ISR 2016-12).
 """
 
 import copy
-from typing_extensions import final
 import warnings
 
 import numpy as np
 from functools import partial
-import matplotlib.pyplot as plt
 from astropy.modeling.fitting import TRFLSQFitter
 from astropy.nddata.utils import NoOverlapError, PartialOverlapError
 from astropy.convolution import Gaussian2DKernel
@@ -433,16 +431,16 @@ class EPSFBuilder:
     .. _bottleneck:  https://github.com/pydata/bottleneck
     """
 
-    def __init__(self, *, 
-                 oversampling=4, 
+    def __init__(self, *,
+                 oversampling=4,
                  shape=None,
-                 epsf_class=ImagePSF, 
-                 fitter=EPSFFitter(), 
+                 epsf_class=ImagePSF,
+                 fitter=None,
                  maxiters=10,
-                 progress_bar=True, 
+                 progress_bar=True,
                  center_accuracy=1.0e-3,
                  gridpoint_estimation='polyfit',
-                 smoothing_kernel='quartic', 
+                 smoothing_kernel='quartic',
                  residual_smoothing_kernel='gaussian',
                  recenter_epsf=True,
                  normalise_epsf=True,
@@ -456,6 +454,9 @@ class EPSFBuilder:
                  pixel_interpolation_method='cubic',
                  residual_despike=True,
                  plot_diagnostics=True,):
+
+        if fitter is None:
+            fitter = EPSFFitter()
 
         if oversampling is None:
             msg = "'oversampling' must be specified"
