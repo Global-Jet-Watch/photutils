@@ -375,6 +375,7 @@ class VariableEPSFFitter(SpatialEPSFFitter):
                  model_weight_maxiters=1, model_weight_center_tol=1.0e-3,
                  max_center_shift=None,
                  use_time_integrated_flux=True, saturation_value=None,
+                 forced_photometry=False,
                  **fitter_kwargs):
         if fitter is None:
             fitter = TRFLSQFitter()
@@ -387,6 +388,7 @@ class VariableEPSFFitter(SpatialEPSFFitter):
                          max_center_shift=max_center_shift,
                          **fitter_kwargs)
         self.use_time_integrated_flux = bool(use_time_integrated_flux)
+        self.forced_photometry = bool(forced_photometry)
         self.saturation_value = None
         if saturation_value is not None:
             saturation_value = float(saturation_value)
@@ -577,6 +579,9 @@ class VariableEPSFFitter(SpatialEPSFFitter):
             local_epsf.flux = star_work.flux
             local_epsf.x_0 = 0.0
             local_epsf.y_0 = 0.0
+            if self.forced_photometry:
+                local_epsf.x_0.fixed = True
+                local_epsf.y_0.fixed = True
 
             with warnings.catch_warnings(record=True) as fit_warnings:
                 warnings.simplefilter('always')
@@ -609,8 +614,10 @@ class VariableEPSFFitter(SpatialEPSFFitter):
             if fit_error_status == 2:
                 break
 
-            x_shift = fitted_epsf.x_0.value
-            y_shift = fitted_epsf.y_0.value
+            x_shift = (0.0 if self.forced_photometry
+                       else fitted_epsf.x_0.value)
+            y_shift = (0.0 if self.forced_photometry
+                       else fitted_epsf.y_0.value)
             max_shift = self._allowed_center_shift(star_work)
             shift_norm = np.hypot(x_shift, y_shift)
             if (not np.isfinite(shift_norm)) or shift_norm > max_shift:
@@ -770,6 +777,7 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
             model_weight_maxiters=self.fitter.model_weight_maxiters,
             model_weight_center_tol=self.fitter.model_weight_center_tol,
             max_center_shift=self.fitter.max_center_shift,
+            forced_photometry=self.fitter.forced_photometry,
             use_time_integrated_flux=self.use_time_integrated_flux,
             saturation_value=self.saturation_value)
 

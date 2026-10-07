@@ -3,12 +3,15 @@
 Tools to estimate ePSF model errors from fitted stars.
 """
 
+import copy
+
 import numpy as np
-from scipy.interpolate import RectBivariateSpline
 from astropy.modeling.fitting import TRFLSQFitter
+from scipy.interpolate import RectBivariateSpline
+from scipy.ndimage import map_coordinates
 
 from photutils.psf.epsf import EPSFFitter
-from photutils.psf.epsf_stars import EPSFStars
+from photutils.psf.epsf_stars import EPSFStars, LinkedEPSFStar
 from photutils.psf.gridded_epsf import GriddedEPSFFitter
 from photutils.psf.gridded_models import GriddedPSFModel
 from photutils.psf.image_models import ImagePSF
@@ -17,6 +20,36 @@ from photutils.psf.variable_epsf import VariableEPSFFitter, VariableEPSFModel
 from photutils.utils._round import py2intround
 
 __all__ = ['EPSFErrorMap', 'calc_epsf_error']
+
+
+class _NonnegativeImageInterpolator:
+    """Shape-preserving interpolation of a nonnegative image."""
+
+    def __init__(self, data):
+        self.data = np.asarray(data, dtype=float)
+        if self.data.ndim != 2 or min(self.data.shape) < 1:
+            raise ValueError('interpolated images must be a non-empty 2D '
+                             'array')
+        self._singleton_x = self.data.shape[1] == 1
+        self._singleton_y = self.data.shape[0] == 1
+
+    def evaluate(self, x, y):
+        x, y = np.broadcast_arrays(
+            np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        if self._singleton_x and self._singleton_y:
+            return np.full(x.shape, self.data[0, 0], dtype=float)
+        if self._singleton_x:
+            values = np.interp(y.ravel(), np.arange(self.data.shape[0]),
+                               self.data[:, 0])
+            return np.maximum(values.reshape(x.shape), 0.0)
+        if self._singleton_y:
+            values = np.interp(x.ravel(), np.arange(self.data.shape[1]),
+                               self.data[0])
+            return np.maximum(values.reshape(x.shape), 0.0)
+        coords = np.vstack((y.ravel(), x.ravel()))
+        values = map_coordinates(self.data, coords, order=1, mode='nearest')
+        return np.maximum(values.reshape(x.shape), 0.0)
+
 
 class EPSFErrorMap:
     """
@@ -95,15 +128,13 @@ class EPSFErrorMap:
         self._origin = np.asarray(origin, dtype=float)
         self.fill_value = float(fill_value)
 
-        ny, nx = self.data.shape
-
-        self._interp = RectBivariateSpline(
-            np.arange(ny, dtype=float),
-            np.arange(nx, dtype=float),
-            self.data,
-            ky=min(3, ny - 1),
-            kx=min(3, nx - 1),
-        )
+        self._data_interpolator = RectBivariateSpline(
+            np.arange(self.data.shape[0], dtype=float),
+            np.arange(self.data.shape[1], dtype=float), self.data,
+            ky=min(3, self.data.shape[0] - 1),
+            kx=min(3, self.data.shape[1] - 1))
+        self._variance_interpolator = _NonnegativeImageInterpolator(
+            self.variance)
 
         self.fit_uncertainties = fit_uncertainties
 
@@ -132,7 +163,7 @@ class EPSFErrorMap:
             (-self.origin[1] - 0.5) / self.oversampling[1],
             (ny - self.origin[1] - 0.5) / self.oversampling[1],
         )
-    
+
     @property
     def oversampling(self):
         if hasattr(self, "_oversampling"):
@@ -147,21 +178,10 @@ class EPSFErrorMap:
             return np.asarray(self._origin, dtype=float)
 
         return np.asarray(self.__dict__["origin"], dtype=float)
-    
+
     @property
     def _interpolator(self):
-        if not hasattr(self, "__interp"):
-            ny, nx = self.data.shape
-
-            self.__interp = RectBivariateSpline(
-                np.arange(ny, dtype=float),
-                np.arange(nx, dtype=float),
-                self.data,
-                ky=min(3, ny - 1),
-                kx=min(3, nx - 1),
-            )
-
-        return self.__interp
+        return self._data_interpolator
 
     def evaluate(self, x, y):
         """
@@ -184,10 +204,7 @@ class EPSFErrorMap:
         x_img = x * self.oversampling[0] + self.origin[0]
         y_img = y * self.oversampling[1] + self.origin[1]
 
-        values = self._interpolator.ev(
-            y_img.ravel(),
-            x_img.ravel(),
-        )
+        values = self._data_interpolator.ev(y_img.ravel(), x_img.ravel())
 
         valid = (
             (x_img.ravel() >= 0)
@@ -200,7 +217,7 @@ class EPSFErrorMap:
         result[valid] = values[valid]
 
         return result.reshape(x.shape)
-    
+
     def evaluate_variance(self, x, y):
         """
         Evaluate the variance map at detector-pixel coordinates.
@@ -222,21 +239,7 @@ class EPSFErrorMap:
         x_img = x * self.oversampling[0] + self.origin[0]
         y_img = y * self.oversampling[1] + self.origin[1]
 
-        if not hasattr(self, "_variance_interpolator"):
-            ny, nx = self.variance.shape
-
-            self._variance_interpolator = RectBivariateSpline(
-                np.arange(ny, dtype=float),
-                np.arange(nx, dtype=float),
-                self.variance,
-                ky=min(3, ny - 1),
-                kx=min(3, nx - 1),
-            )
-
-        values = self._variance_interpolator.ev(
-            y_img.ravel(),
-            x_img.ravel(),
-        )
+        values = self._variance_interpolator.evaluate(x_img, y_img).ravel()
 
         valid = (
             (x_img.ravel() >= 0)
@@ -355,8 +358,8 @@ def calc_epsf_error(epsf, stars, *, fit_stars=True, fitter=None,
 
     forced_photometry: bool, optional
         Only applicable if fit_stars is `True`. If `True`, then star fitting
-        uses forced photometry where the positions of stars are fixed by their
-        linked star average positions, only the flux of stars is fit. Default 
+        uses forced photometry where linked stars share their average
+        position and only the flux is fit. Default
         is `False`.
 
     Returns
@@ -377,14 +380,41 @@ def calc_epsf_error(epsf, stars, *, fit_stars=True, fitter=None,
         if fitter is None:
             fitter = _default_fitter(epsf)
 
-        stars = fitter(epsf, stars)
-
         if forced_photometry:
             stars.constrain_linked_centres(remove_outliers=True)
-            epsf.x_0.fixed = True
-            epsf.y_0.fixed = True
+            if isinstance(epsf, GriddedPSFModel):
+                if not isinstance(fitter, GriddedEPSFFitter):
+                    raise TypeError('forced photometry for GriddedPSFModel '
+                                    'requires a GriddedEPSFFitter')
+                for item in stars:
+                    if isinstance(item, LinkedEPSFStar):
+                        item.constrain_centers(remove_outliers=True)
+                stars = fitter(epsf, stars, forced_photometry=True)
+            elif isinstance(epsf, VariableEPSFModel):
+                if not isinstance(fitter, VariableEPSFFitter):
+                    raise TypeError('forced photometry for '
+                                    'VariableEPSFModel requires a '
+                                    'VariableEPSFFitter')
+                fit_fitter = copy.copy(fitter)
+                fit_fitter.forced_photometry = True
+                stars = fit_fitter(epsf, stars)
+            elif isinstance(epsf, SpatialEPSFModel):
+                if not isinstance(fitter, SpatialEPSFFitter):
+                    raise TypeError('forced photometry for spatial ePSF '
+                                    'models requires a SpatialEPSFFitter')
+                fit_fitter = copy.copy(fitter)
+                fit_fitter.forced_photometry = True
+                stars = fit_fitter(epsf, stars)
+            elif isinstance(epsf, ImagePSF):
+                fit_model = epsf.copy()
+                fit_model.x_0.fixed = True
+                fit_model.y_0.fixed = True
+                stars = fitter(fit_model, stars)
+            else:
+                raise TypeError('forced photometry requires an ImagePSF or '
+                                'spatial ePSF model')
+        else:
             stars = fitter(epsf, stars)
-        
 
     good_stars = stars.all_good_stars
     if len(good_stars) == 0:
@@ -442,10 +472,8 @@ def calc_epsf_error(epsf, stars, *, fit_stars=True, fitter=None,
         sigma_flux = None
         sigma_x = None
         sigma_y = None
-        n_cov = 0
-        n_cov_from_jac = 0
         if hasattr(star, '_fit_info'):
-            if "param_cov" in star._fit_info.keys():
+            if 'param_cov' in star._fit_info:
                 cov = star._fit_info["param_cov"]
                 if cov is not None:
                     sigma_flux = np.sqrt(cov[0, 0]) / star.flux
@@ -455,7 +483,6 @@ def calc_epsf_error(epsf, stars, *, fit_stars=True, fitter=None,
                     else:
                         sigma_x = None
                         sigma_y = None
-                    n_cov += 1
                 else:
                     jac = star._fit_info["jac"]
                     cost = star._fit_info["cost"]
@@ -469,10 +496,6 @@ def calc_epsf_error(epsf, stars, *, fit_stars=True, fitter=None,
                     else:
                         sigma_x = None
                         sigma_y = None
-                    n_cov_from_jac += 1
-
-
-
         sigma_fluxes.append(sigma_flux)
         sigma_xs.append(sigma_x)
         sigma_ys.append(sigma_y)
@@ -482,9 +505,6 @@ def calc_epsf_error(epsf, stars, *, fit_stars=True, fitter=None,
         "sigma_x": sigma_xs,
         "sigma_y": sigma_ys,
     }
-    print(n_cov)
-    print(n_cov_from_jac)
-
     mean_residual = np.full(shape, np.nan)
     residual_variance = np.full(shape, np.nan)
     noise_variance = np.full(shape, np.nan)
@@ -547,7 +567,7 @@ def _local_image_psf(epsf, star):
         data = _interpolate_gridded_epsf(epsf, star.center[0],
                                          star.center[1])
         return ImagePSF(data, oversampling=epsf.oversampling,
-                        origin=epsf.origin, fill_value=epsf.fill_value)
+                        fill_value=epsf.fill_value)
     if isinstance(epsf, ImagePSF):
         return epsf
     raise TypeError('epsf must be an ImagePSF, SpatialEPSFModel, '

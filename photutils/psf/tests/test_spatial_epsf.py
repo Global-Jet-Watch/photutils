@@ -155,6 +155,19 @@ def test_spatial_epsf_fitter_warning_pattern_marks_failure():
     assert_allclose(fitted[0].cutout_center, (2.0, 2.0), atol=1.0e-12)
 
 
+def test_spatial_epsf_fitter_forced_photometry_fixes_center():
+    star = EPSFStar(np.ones((5, 5), dtype=float),
+                    cutout_center=(2.0, 2.0))
+    fitter_backend = _ShiftFitter(shifts=[0.4])
+    fitter = SpatialEPSFFitter(fitter=fitter_backend, fit_boxsize=None,
+                               forced_photometry=True)
+
+    fitted = fitter(_make_spatial_model(), EPSFStars([star]))
+
+    assert_allclose(fitted[0].cutout_center, (2.0, 2.0))
+    assert fitter_backend.calls == 1
+
+
 def test_spatial_epsf_fitter_reweights_with_updated_center():
     star = EPSFStar(np.ones((5, 5), dtype=float),
                     weights=np.ones((5, 5), dtype=float),

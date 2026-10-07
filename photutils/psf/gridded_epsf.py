@@ -131,7 +131,8 @@ class GriddedEPSFFitter:
         return epsf
 
     def _fit_star_with_gridded_model(self, gridded_psf_model,
-                                    star, fit_boxsize):
+                                    star, fit_boxsize,
+                                    forced_photometry=False):
         """
         Fit a single star using the gridded ePSF model.
 
@@ -182,6 +183,9 @@ class GriddedEPSFFitter:
         _epsf.flux = star.flux
         _epsf.x_0 = 0.0
         _epsf.y_0 = 0.0
+        if forced_photometry:
+            _epsf.x_0.fixed = True
+            _epsf.y_0.fixed = True
 
         try:
             fitted_epsf = self.fitter.fitter(model=_epsf, x=xx, y=yy,
@@ -214,15 +218,17 @@ class GriddedEPSFFitter:
         # Update star with fitted parameters
         star = copy.deepcopy(star)
         star.flux = fitted_epsf.flux.value
-        star.cutout_center = (star.cutout_center[0] + fitted_epsf.x_0.value,
-                              star.cutout_center[1] + fitted_epsf.y_0.value)
+        if not forced_photometry:
+            star.cutout_center = (
+                star.cutout_center[0] + fitted_epsf.x_0.value,
+                star.cutout_center[1] + fitted_epsf.y_0.value)
         star._fit_error_status = 0
         star._fit_info = fit_info
         star._fitinfo = fit_info
 
         return star
 
-    def __call__(self, gridded_psf_model, stars):
+    def __call__(self, gridded_psf_model, stars, *, forced_photometry=False):
         """
         Fit the gridded ePSF model to stars.
 
@@ -251,7 +257,8 @@ class GriddedEPSFFitter:
         for star in stars:
             if isinstance(star, EPSFStar):
                 fitted_star = self._fit_star_with_gridded_model(
-                    gridded_psf_model, star, self.fitter.fit_boxsize)
+                    gridded_psf_model, star, self.fitter.fit_boxsize,
+                    forced_photometry=forced_photometry)
 
             elif isinstance(star, LinkedEPSFStar):
                 fitted_star = []
@@ -259,7 +266,8 @@ class GriddedEPSFFitter:
                     fitted_star.append(
                         self._fit_star_with_gridded_model(
                             gridded_psf_model, linked_star,
-                            self.fitter.fit_boxsize))
+                            self.fitter.fit_boxsize,
+                            forced_photometry=forced_photometry))
                 fitted_star = LinkedEPSFStar(fitted_star)
 
             else:

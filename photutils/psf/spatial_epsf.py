@@ -502,6 +502,7 @@ class SpatialEPSFFitter:
                  plot_fit_checks=False, model_weight_map=None,
                  model_weight_maxiters=1, model_weight_center_tol=1.0e-3,
                  max_center_shift=None,
+                 forced_photometry=False,
                  **fitter_kwargs):
         if fitter is None:
             fitter = TRFLSQFitter()
@@ -512,6 +513,7 @@ class SpatialEPSFFitter:
                                         lower_bound=(3, 0), check_odd=True))
         self.progress_bar = bool(progress_bar)
         self.plot_fit_checks = bool(plot_fit_checks)
+        self.forced_photometry = bool(forced_photometry)
 
         # Temporary test of the effect of model_weight_map:
         if model_weight_map is None:
@@ -790,6 +792,9 @@ class SpatialEPSFFitter:
             local_epsf.flux = star_work.flux
             local_epsf.x_0 = 0.0
             local_epsf.y_0 = 0.0
+            if self.forced_photometry:
+                local_epsf.x_0.fixed = True
+                local_epsf.y_0.fixed = True
 
             with warnings.catch_warnings(record=True) as fit_warnings:
                 warnings.simplefilter('always')
@@ -822,8 +827,10 @@ class SpatialEPSFFitter:
             if fit_error_status == 2:
                 break
 
-            x_shift = fitted_epsf.x_0.value
-            y_shift = fitted_epsf.y_0.value
+            x_shift = (0.0 if self.forced_photometry
+                       else fitted_epsf.x_0.value)
+            y_shift = (0.0 if self.forced_photometry
+                       else fitted_epsf.y_0.value)
             max_shift = self._allowed_center_shift(star_work)
             shift_norm = np.hypot(x_shift, y_shift)
             if (not np.isfinite(shift_norm)) or shift_norm > max_shift:

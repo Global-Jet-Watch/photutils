@@ -7,9 +7,20 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from photutils.psf.epsf import EPSFFitter
 from photutils.psf.epsf_model_error import EPSFErrorMap, calc_epsf_error
-from photutils.psf.epsf_stars import EPSFStar, EPSFStars
+from photutils.psf.epsf_stars import EPSFStar, EPSFStars, LinkedEPSFStar
+from photutils.psf.gridded_epsf import GriddedEPSFFitter
+from photutils.psf.gridded_models import GriddedPSFModel
 from photutils.psf.image_models import ImagePSF
+
+
+class _SimpleWCS:
+    def pixel_to_world_values(self, x, y):
+        return x, y
+
+    def world_to_pixel_values(self, x, y):
+        return x, y
 
 
 def test_calc_epsf_error_imagepsf():
@@ -94,3 +105,53 @@ def test_calc_epsf_error_inputs():
 
     with pytest.raises(ValueError, match='non-excluded star'):
         calc_epsf_error(epsf, EPSFStars([star]), fit_stars=False)
+
+
+def test_epsf_error_map_variance_interpolation_is_nonnegative():
+    variance = np.zeros((5, 5), dtype=float)
+    variance[2, 2] = 1.0
+    error_map = EPSFErrorMap(np.sqrt(variance), variance=variance,
+                             oversampling=2)
+
+    x = np.linspace(-1.0, 1.0, 41)
+    xx, yy = np.meshgrid(x, x)
+    assert np.all(error_map.evaluate_variance(xx, yy) >= 0.0)
+
+
+def test_forced_photometry_preserves_model_parameter_state():
+    epsf = ImagePSF(np.ones((5, 5), dtype=float), oversampling=1)
+    epsf.x_0.fixed = False
+    epsf.y_0.fixed = False
+    star = EPSFStar(np.ones((5, 5), dtype=float),
+                    cutout_center=(2.0, 2.0))
+
+    calc_epsf_error(epsf, EPSFStars([star]), forced_photometry=True)
+
+    assert not epsf.x_0.fixed
+    assert not epsf.y_0.fixed
+
+
+def test_forced_photometry_gridded_model():
+    from astropy.nddata import NDData
+
+    psfs = np.ones((4, 5, 5), dtype=float)
+    meta = {'grid_xypos': np.array([[0.0, 0.0], [1.0, 0.0],
+                                   [0.0, 1.0], [1.0, 1.0]]),
+            'oversampling': 1}
+    model = GriddedPSFModel(NDData(psfs, meta=meta))
+    linked_stars = []
+    for origin in ((0, 0), (5, 5)):
+        star = EPSFStar(np.ones((5, 5), dtype=float),
+                        cutout_center=(2.0, 2.0), origin=origin,
+                        wcs_large=_SimpleWCS())
+        star.flux = 25.0
+        linked_stars.append(star)
+    linked = LinkedEPSFStar(linked_stars)
+    stars = EPSFStars([linked])
+    error_map = calc_epsf_error(
+        model, stars, forced_photometry=True,
+        fitter=GriddedEPSFFitter(
+            (10, 10), (2, 2), fitter=EPSFFitter(fit_boxsize=None)))
+
+    assert isinstance(error_map, EPSFErrorMap)
+    assert_allclose(linked_stars[0].center, linked_stars[1].center)
