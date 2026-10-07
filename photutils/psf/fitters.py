@@ -148,12 +148,13 @@ class PriorLogTRFLSQFitter:
         # store OptimizeResult
         self.fit_info = res
 
-        # split jacobian into data and prior parts for diagnostics
-        J_full = res.jac                    # (m + n_params) x n_params
-        m_full, n = J_full.shape
-        m_data = data_flat.size
-        J_data = J_full[:m_data, :]
-        J_prior = J_full[m_data:, :]
+        # Keep only valid data rows in covariance calculations. Residuals
+        # retain their fixed length for least_squares, so masked rows are zero.
+        J_full = res.jac
+        n = J_full.shape[1]
+        J_data = J_full[:data_flat.size, :][valid_data]
+        J_prior = J_full[data_flat.size:, :]
+        J_cov = np.vstack((J_data, J_prior))
 
         # --- update model parameters from fitted internal params ---
         fitted_internal = res.x
@@ -196,7 +197,7 @@ class PriorLogTRFLSQFitter:
         dof = max(1, m_valid - n)
         sigma2 = (resid_data**2).sum() / float(dof)
 
-        JTJ = J_full.T @ J_full
+        JTJ = J_cov.T @ J_cov
         cond = np.linalg.cond(JTJ)
         try:
             cov_internal = np.linalg.inv(JTJ) * sigma2

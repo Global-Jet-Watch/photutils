@@ -55,6 +55,20 @@ def test_prior_log_trf_lsq_fitter_masks_nonpositive_weights():
     assert_allclose(masked_flux, clean_flux, rtol=5.0e-5, atol=0.0)
 
 
+def test_prior_log_trf_lsq_fitter_covariance_excludes_masked_rows():
+    yy, xx = np.indices((7, 7), dtype=float)
+    data = np.exp(-((xx - 3.0)**2 + (yy - 3.0)**2) / 2.0)
+    model = ImagePSF(data.copy(), flux=10.0, x_0=3.0, y_0=3.0)
+    weights = np.ones_like(data)
+    weights[:3, :] = 0.0
+
+    fitter = PriorLogTRFLSQFitter(max_nfev=1000)
+    fitter(model, xx - 3.0, yy - 3.0, data * 10.0, weights=weights)
+
+    assert np.all(np.isfinite(fitter.fit_info['param_cov_internal']))
+    assert fitter.fit_info['param_cov_internal'][0, 0] > 0.0
+
+
 def test_epsf_fitter_includes_model_error_variance_in_weights():
     epsf = ImagePSF(np.zeros((4, 4), dtype=float), oversampling=1)
     error_map = EPSFErrorMap(np.zeros((4, 4), dtype=float),
