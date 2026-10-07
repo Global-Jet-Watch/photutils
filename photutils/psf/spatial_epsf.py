@@ -1379,13 +1379,46 @@ class SpatialEPSFBuilder:
         residual_img = star.compute_residual_image(local_epsf)
         residual_img /= max(star.flux, 1.0e-12)
         residual_img = np.asanyarray(residual_img, dtype=float)
-        
+
+        saturation_mask = None
+        saturation_value = getattr(self, 'saturation_value', None)
+        if saturation_value is not None:
+            warned_attr = '_warned_missing_saturation_exptime'
+            exposure_time = getattr(star, 'exposure_time', None)
+            if exposure_time is None:
+                if (hasattr(self, warned_attr)
+                        and not getattr(self, warned_attr)):
+                    warnings.warn('One or more stars do not define '
+                                  'exposure_time; falling back to the '
+                                  'unsaturated residual fit for saturated '
+                                  'grid sections.', AstropyUserWarning)
+                    setattr(self, warned_attr, True)
+            else:
+                exposure_time = float(exposure_time)
+                if np.isfinite(exposure_time) and exposure_time > 0.0:
+                    saturation_mask = (
+                        np.asanyarray(star.data, dtype=float)
+                        * exposure_time >= saturation_value)
+                elif (hasattr(self, warned_attr)
+                      and not getattr(self, warned_attr)):
+                    warnings.warn('Encountered non-finite or '
+                                  'non-positive exposure_time; falling '
+                                  'back to the unsaturated residual fit '
+                                  'for saturated grid sections.',
+                                  AstropyUserWarning)
+                    setattr(self, warned_attr, True)
+
         # Keep only unmasked residual samples so values match the
         # unmasked coordinate vectors (star._xidx_centered/_yidx_centered).
+        if saturation_mask is None:
+            saturation_mask = np.zeros_like(residual_img, dtype=bool)
         if getattr(star, 'mask', None) is not None:
-            residual_img = residual_img[~np.asarray(star.mask)].ravel()
+            star_mask = np.asarray(star.mask)
+            residual_img = residual_img[~star_mask].ravel()
+            saturation_mask = saturation_mask[~star_mask].ravel()
         else:
             residual_img = residual_img.ravel()
+            saturation_mask = saturation_mask.ravel()
 
         # `star._xidx_centered` and `_yidx_centered` already contain the
         # 1D coordinates of unmasked samples, so convert them directly
@@ -1425,8 +1458,11 @@ class SpatialEPSFBuilder:
                                         / np.sqrt(2.0)))
         x_coords_img[yidx_, xidx_] = x_coord_
         y_coords_img[yidx_, xidx_] = y_coord_
+        saturation_img = np.full(spatial_model.shape, False, dtype=bool)
+        saturation_img[yidx_, xidx_] = saturation_mask[mask]
 
-        return resampled_img, img_weights, x_coords_img, y_coords_img
+        return (resampled_img, img_weights, x_coords_img, y_coords_img,
+            saturation_img)
 
     def _resample_residuals(self, stars, spatial_model):
         nstars = stars.n_good_stars
@@ -1435,6 +1471,7 @@ class SpatialEPSFBuilder:
         weights = np.zeros(shape)
         x_coords = np.zeros(shape)
         y_coords = np.zeros(shape)
+        saturation_mask = np.zeros(shape, dtype=bool)
         det_x = np.zeros(nstars)
         det_y = np.zeros(nstars)
         group_id = np.full(nstars, -1, dtype=int)
@@ -1445,7 +1482,8 @@ class SpatialEPSFBuilder:
             if isinstance(item, LinkedEPSFStar):
                 for star in item.all_good_stars:
                     resampled = self._resample_residual(star, spatial_model)
-                    residuals[i], weights[i], x_coords[i], y_coords[i] = resampled
+                    (residuals[i], weights[i], x_coords[i], y_coords[i],
+                     saturation_mask[i]) = resampled
                     det_x[i] = star.center[0]
                     det_y[i] = star.center[1]
                     group_id[i] = linked_id
@@ -1456,12 +1494,14 @@ class SpatialEPSFBuilder:
             if item._excluded_from_fit:
                 continue
             resampled = self._resample_residual(item, spatial_model)
-            residuals[i], weights[i], x_coords[i], y_coords[i] = resampled
+            (residuals[i], weights[i], x_coords[i], y_coords[i],
+             saturation_mask[i]) = resampled
             det_x[i] = item.center[0]
             det_y[i] = item.center[1]
             i += 1
 
-        return residuals, weights, x_coords, y_coords, det_x, det_y, group_id
+        return (residuals, weights, x_coords, y_coords, saturation_mask,
+                det_x, det_y, group_id)
 
     @staticmethod
     def _mad_std(data):
@@ -1541,40 +1581,56 @@ class SpatialEPSFBuilder:
         return np.minimum(core, max_core)
 
     def _interpolate_missing_coefficient_images(self, coeff_data, *,
-                                                context='coefficient'):
+                                                context='coefficient',
+                                                protected_mask=None):
         if not getattr(self, 'interpolate_missing_coefficients', True):
             coeff_data = np.array(coeff_data, copy=True, dtype=float)
             coeff_data[~np.isfinite(coeff_data)] = 0.0
             return coeff_data
 
         coeff_data = np.array(coeff_data, copy=True, dtype=float)
+        if protected_mask is not None:
+            protected_mask = np.asanyarray(protected_mask, dtype=bool)
+            if protected_mask.shape != coeff_data.shape[1:]:
+                raise ValueError('protected_mask must match coefficient '
+                                 'image shape')
+
         not_interpolated_count = 0
         for idx in range(coeff_data.shape[0]):
-            image = coeff_data[idx]
-            mask = ~np.isfinite(image)
-            if not np.any(mask):
+            image = np.array(coeff_data[idx], copy=True)
+            target_mask = ~np.isfinite(image)
+            if protected_mask is not None:
+                image[protected_mask] = np.nan
+                target_mask &= ~protected_mask
+            if not np.any(target_mask):
                 continue
 
-            if np.all(mask):
-                image[:] = 0.0
-                not_interpolated_count += np.count_nonzero(mask)
+            source_mask = ~np.isfinite(image)
+            if np.all(source_mask):
+                if protected_mask is None:
+                    image[target_mask] = 0.0
+                    not_interpolated_count += np.count_nonzero(target_mask)
+                coeff_data[idx] = image
                 continue
 
             method = getattr(self, 'coefficient_interpolation_method',
                              'cubic')
-            if method == 'cubic' and np.count_nonzero(~mask) < 3:
+            if method == 'cubic' and np.count_nonzero(~source_mask) < 3:
                 method = 'nearest'
 
             try:
-                image = _interpolate_missing_data(image, mask=mask,
-                                                  method=method)
+                image = _interpolate_missing_data(
+                    image, mask=target_mask, method=method)
             except Exception:
                 # If interpolation fails for this image, set missing
                 # values to zero so the rest of the pipeline can run.
-                image[mask] = 0.0
+                image[target_mask] = 0.0
+
+            if protected_mask is not None:
+                image[protected_mask] = np.nan
 
             coeff_data[idx] = image
-        if not_interpolated_count > 0:
+        if protected_mask is None and not_interpolated_count > 0:
             warnings.warn(
                 f'Interpolation is not possible for '
                 f'{not_interpolated_count} missing {context} value(s) '
@@ -1582,7 +1638,8 @@ class SpatialEPSFBuilder:
                 'setting them to 0.',
                 AstropyUserWarning)
 
-        coeff_data[~np.isfinite(coeff_data)] = 0.0
+        if protected_mask is None:
+            coeff_data[~np.isfinite(coeff_data)] = 0.0
         return coeff_data
 
     def _warn_insufficient_coefficient_samples(self, missing_mask,
@@ -1615,7 +1672,8 @@ class SpatialEPSFBuilder:
         return mask
 
     def _fit_residual_coefficients(self, residuals, det_x, det_y,
-                                   x_coords=None, y_coords=None):
+                                   x_coords=None, y_coords=None,
+                                   saturation_mask=None):
         """
         Fit detector-position-dependent residual coefficient surfaces.
 
@@ -1643,6 +1701,7 @@ class SpatialEPSFBuilder:
         n_adaptive_reduced = 0
         skipped_underdetermined = 0
         skipped_rank_deficient = 0
+        protected_mask = np.zeros((ny, nx), dtype=bool)
         use_offsets = x_coords is not None and y_coords is not None
         xcenter = nx // 2
         ycenter = ny // 2
@@ -1659,7 +1718,23 @@ class SpatialEPSFBuilder:
                     dx = x_coords[:, iy, ix]
                     dy = y_coords[:, iy, ix]
                     valid &= np.isfinite(dx) & np.isfinite(dy)
+                if saturation_mask is not None:
+                    saturated = np.asanyarray(saturation_mask[:, iy, ix],
+                                              dtype=bool)
+                    sat_count = np.count_nonzero(valid & saturated)
+                    exclude_any_saturated_gridcell = bool(getattr(
+                        self, 'exclude_any_saturated_gridcell', False))
+                    if sat_count > 0 and exclude_any_saturated_gridcell:
+                        protected_mask[iy, ix] = True
+                        coeff_update[:, iy, ix] = np.nan
+                        continue
+                    valid &= ~saturated
+                else:
+                    sat_count = 0
                 if np.count_nonzero(valid) < self.residual_min_valid_samples:
+                    if sat_count > 0:
+                        protected_mask[iy, ix] = True
+                        coeff_update[:, iy, ix] = np.nan
                     continue
 
                 z_valid = z[valid]
@@ -1736,13 +1811,14 @@ class SpatialEPSFBuilder:
                     max_abs_coeff_nfit = z_fit.size
 
         missing_mask = np.any(~np.isfinite(coeff_update), axis=0)
+        missing_mask &= ~protected_mask
         n_missing = np.sum(missing_mask)
         self._warn_insufficient_coefficient_samples(
             missing_mask, self.residual_min_valid_samples,
             'position residual coefficient')
         
         # Debug: log stats before interpolation
-        valid_before_interp = coeff_update[:, ~missing_mask]
+        valid_before_interp = coeff_update[:, ~(missing_mask | protected_mask)]
         if valid_before_interp.size > 0:
             coeff_abs = np.abs(valid_before_interp)
             coeff_p99 = np.percentile(coeff_abs, 99)
@@ -1783,10 +1859,11 @@ class SpatialEPSFBuilder:
                 f'n_fit_samples={max_abs_coeff_nfit}')
         
         coeff_update = self._interpolate_missing_coefficient_images(
-            coeff_update, context='position residual coefficient')
+            coeff_update, context='position residual coefficient',
+            protected_mask=protected_mask)
 
         # Debug: log stats after interpolation
-        valid_after_interp = coeff_update[:, ~missing_mask]
+        valid_after_interp = coeff_update[:, ~(missing_mask | protected_mask)]
         if valid_after_interp.size > 0:
             coeff_abs = np.abs(valid_after_interp)
             self._log(
@@ -1802,6 +1879,7 @@ class SpatialEPSFBuilder:
         # residual updates in poorly sampled regions can destabilize later
         # fitting iterations.
         coeff_update[:, missing_mask] = 0.0
+        coeff_update[:, protected_mask] = 0.0
         
         # Debug: verify zeroing happened
         zeroed_cells = coeff_update[:, missing_mask]
@@ -2974,8 +3052,9 @@ class SpatialEPSFBuilder:
 
             self._log(f'SpatialEPSFBuilder: iteration {iter_num} resampling '
                       'residual stack')
-            residuals, weights, x_coords, y_coords, det_x, det_y, group_id = (
-                self._resample_residuals(residual_stars, spatial_model))
+            (residuals, weights, x_coords, y_coords, saturation_mask,
+             det_x, det_y, group_id) = self._resample_residuals(
+                residual_stars, spatial_model)
 
             # Debug: log residual stack statistics
             valid_residuals = residuals[np.isfinite(residuals)]
@@ -2996,7 +3075,8 @@ class SpatialEPSFBuilder:
             self._log(f'SpatialEPSFBuilder: iteration {iter_num} fitting '
                       'spatial residual coefficient surfaces')
             coeff_update = self._fit_residual_coefficients(
-                residuals, det_x, det_y, x_coords=x_coords, y_coords=y_coords)
+                residuals, det_x, det_y, x_coords=x_coords, y_coords=y_coords,
+                saturation_mask=saturation_mask)
             underconstrained_mask = self._underconstrained_residual_mask(
                 residuals, x_coords=x_coords, y_coords=y_coords)
 

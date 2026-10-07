@@ -48,6 +48,21 @@ def test_variable_epsf_model_additive_fwhm_dependency():
     assert_allclose(model.local_epsf_data(5.0, 5.0, fwhm=4.0), 4.0)
 
 
+def test_variable_epsf_model_constant_additive_fwhm_dependency():
+    coeff_data = np.full((1, 3, 3), 2.0, dtype=float)
+    fwhm_coeff_data = np.full((1, 3, 3), 0.5, dtype=float)
+
+    model = VariableEPSFModel(coeff_data, oversampling=1,
+                              detector_shape=(10, 10), degree=0,
+                              dependencies=('FWHM',),
+                              fwhm_correction_mode='additive',
+                              fwhm_coeff_data=fwhm_coeff_data,
+                              fwhm_degree=0, normalize_local_epsf=False)
+
+    assert_allclose(model.local_epsf_data(5.0, 5.0, fwhm=1.0), 2.5)
+    assert_allclose(model.local_epsf_data(5.0, 5.0, fwhm=100.0), 2.5)
+
+
 def test_variable_epsf_model_additive_flux_dependency():
     coeff_data = np.full((1, 3, 3), 2.0, dtype=float)
     flux_coeff_data = np.full((1, 3, 3), 2.0, dtype=float)
@@ -77,6 +92,82 @@ def test_variable_epsf_model_constant_flux_dependency():
 
     assert_allclose(model.local_epsf_data(5.0, 5.0, flux=1.0), 3.0)
     assert_allclose(model.local_epsf_data(5.0, 5.0, flux=100.0), 3.0)
+
+
+def test_variable_epsf_builder_normalizes_flux_and_fwhm_samples():
+    flux_norm, flux_reference, flux_scale = (
+        VariableEPSFBuilder._normalize_flux_samples(
+            np.array([10.0, 20.0, 30.0])))
+    fwhm_norm, fwhm_reference, fwhm_scale = (
+        VariableEPSFBuilder._normalize_fwhm_samples(
+            np.array([1.0, 1.5, 2.0])))
+
+    assert_allclose(flux_norm, [0.0, 0.5, 1.0])
+    assert flux_reference == 10.0
+    assert flux_scale == 20.0
+    assert_allclose(fwhm_norm, [0.0, 0.5, 1.0])
+    assert fwhm_reference == 1.0
+    assert fwhm_scale == 1.0
+
+
+def test_variable_epsf_builder_normalizes_log10_flux_samples():
+    builder = VariableEPSFBuilder(
+        dependencies=('Flux',), fit_dependencies=('Flux',),
+        detector_shape=(10, 10), flux_transform='log10')
+
+    flux_norm, flux_reference, flux_scale = builder._normalize_flux_samples(
+        np.array([1.0e2, 1.0e4, 1.0e6]), flux_transform='log10')
+
+    assert_allclose(flux_norm, [0.0, 0.5, 1.0])
+    assert flux_reference == 2.0
+    assert flux_scale == 4.0
+
+
+def test_variable_epsf_builder_uses_provided_flux_mapping():
+    flux_norm, flux_reference, flux_scale = (
+        VariableEPSFBuilder._normalize_flux_samples(
+            np.array([1.0e2, 1.0e4, 1.0e6]),
+            flux_transform='log10', reference=2.0, scale=1.0))
+
+    assert_allclose(flux_norm, [0.0, 2.0, 4.0])
+    assert flux_reference == 2.0
+    assert flux_scale == 1.0
+
+
+def test_variable_epsf_builder_uses_provided_fwhm_mapping():
+    builder = VariableEPSFBuilder(
+        dependencies=('FWHM',), fit_dependencies=('FWHM',),
+        detector_shape=(10, 10), fwhm_degree=1, fwhm_min_valid_samples=1)
+    residuals = np.full((3, 2, 2), 0.25, dtype=float)
+    weights = np.ones_like(residuals)
+    effective_fwhm = np.array([1.0, 2.0, 3.0])
+
+    coeff, fwhm_reference, fwhm_scale = builder._fit_fwhm_coefficients(
+        residuals, weights, effective_fwhm,
+        fwhm_reference=2.0, fwhm_scale=2.0)
+
+    assert coeff.shape == (1, 2, 2)
+    assert fwhm_reference == 2.0
+    assert fwhm_scale == 2.0
+
+
+def test_variable_epsf_model_log10_flux_dependency():
+    coeff_data = np.full((1, 3, 3), 2.0, dtype=float)
+    flux_coeff_data = np.full((1, 3, 3), 2.0, dtype=float)
+
+    model = VariableEPSFModel(coeff_data, oversampling=1,
+                              detector_shape=(10, 10), degree=0,
+                              dependencies=('Flux',),
+                              flux_correction_mode='additive',
+                              flux_coeff_data=flux_coeff_data,
+                              flux_degree=1, flux_reference=2.0,
+                              flux_scale=1.0,
+                              flux_transform='log10',
+                              normalize_local_epsf=False)
+
+    assert_allclose(model.local_epsf_data(5.0, 5.0, flux=1.0e2), 2.0)
+    assert_allclose(model.local_epsf_data(5.0, 5.0, flux=1.0e3), 4.0)
+    assert_allclose(model.local_epsf_data(5.0, 5.0), 2.0)
 
 
 def test_variable_epsf_model_invalid_correction_mode():
@@ -184,6 +275,20 @@ class _WarnButIerrOkFitter:
         return model
 
 
+class _CaptureWeightsFitter:
+    fit_info = {'ierr': 1}
+
+    def __init__(self):
+        self.last_weights = None
+
+    def __call__(self, model, x, y, z, weights=None, **kwargs):
+        self.last_weights = np.array(weights, copy=True)
+        model.x_0 = 0.0
+        model.y_0 = 0.0
+        model.flux = float(model.flux.value)
+        return model
+
+
 def test_variable_epsf_fitter_fwhm_only_no_exposure_time_warning():
     coeff_data = np.ones((1, 5, 5), dtype=float)
     fwhm_coeff_data = np.zeros((1, 5, 5), dtype=float)
@@ -254,6 +359,24 @@ def test_variable_epsf_fitter_warning_pattern_marks_failure():
     assert_allclose(fitted[0].cutout_center, (2.0, 2.0), atol=1.0e-12)
 
 
+def test_variable_epsf_fitter_masks_saturated_pixels():
+    coeff_data = np.ones((1, 5, 5), dtype=float)
+    model = VariableEPSFModel(coeff_data, oversampling=1,
+                              detector_shape=(10, 10), degree=0)
+    data = np.ones((5, 5), dtype=float)
+    data[2, 2] = 200.0
+    star = EPSFStar(data, cutout_center=(2.0, 2.0), exposure_time=1.0)
+    fitter_impl = _CaptureWeightsFitter()
+    fitter = VariableEPSFFitter(fitter=fitter_impl, fit_boxsize=None,
+                                saturation_value=100.0)
+
+    fitter(model, EPSFStars([star]))
+
+    assert fitter_impl.last_weights is not None
+    assert fitter_impl.last_weights[2, 2] == 0.0
+    assert fitter_impl.last_weights[1, 1] > 0.0
+
+
 def test_variable_epsf_builder_fractional_residuals_core_floor():
     residuals = np.ones((1, 3, 3), dtype=float)
     model_data = np.array([[
@@ -320,6 +443,100 @@ def test_variable_epsf_builder_fits_constant_flux_coefficients():
 
     assert coeff.shape == (1, 2, 2)
     assert_allclose(coeff, 0.25)
+
+
+def test_variable_epsf_builder_freezes_saturated_position_cells():
+    builder = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        detector_shape=(10, 10), degree=0, residual_min_valid_samples=2)
+    residuals = np.array([
+        [[5.0, 2.0], [3.0, 4.0]],
+        [[5.0, 2.0], [3.0, 4.0]],
+    ], dtype=float)
+    saturation_mask = np.zeros_like(residuals, dtype=bool)
+    saturation_mask[0, 0, 0] = True
+    det_x = np.array([1.0, 2.0])
+    det_y = np.array([1.0, 2.0])
+
+    coeff = builder._fit_residual_coefficients(
+        residuals, det_x, det_y, saturation_mask=saturation_mask)
+
+    assert coeff.shape == (1, 2, 2)
+    assert_allclose(coeff[0, 0, 0], 0.0)
+    assert_allclose(coeff[0, 0, 1], 2.0)
+    assert_allclose(coeff[0, 1, 0], 3.0)
+
+
+def test_variable_epsf_builder_excludes_mixed_saturated_position_cells_by_default():
+    builder = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        detector_shape=(10, 10), degree=0, residual_min_valid_samples=2)
+    residuals = np.array([
+        [[9.0, 2.0], [3.0, 4.0]],
+        [[9.0, 2.0], [3.0, 4.0]],
+        [[9.0, 2.0], [3.0, 4.0]],
+    ], dtype=float)
+    # This cell has one saturated sample but still enough unsaturated
+    # samples to meet residual_min_valid_samples.
+    saturation_mask = np.zeros_like(residuals, dtype=bool)
+    saturation_mask[0, 0, 0] = True
+    det_x = np.array([1.0, 2.0, 3.0])
+    det_y = np.array([1.0, 2.0, 3.0])
+
+    coeff = builder._fit_residual_coefficients(
+        residuals, det_x, det_y, saturation_mask=saturation_mask)
+
+    assert coeff.shape == (1, 2, 2)
+    assert_allclose(coeff[0, 0, 0], 0.0)
+    assert_allclose(coeff[0, 0, 1], 2.0)
+
+
+def test_variable_epsf_builder_freezes_saturated_flux_cells():
+    builder = VariableEPSFBuilder(
+        dependencies=('Flux',), fit_dependencies=('Flux',),
+        detector_shape=(10, 10), flux_degree=0, flux_min_valid_samples=2,
+        use_time_integrated_flux=False)
+    residuals = np.array([
+        [[5.0, 2.0], [3.0, 4.0]],
+        [[5.0, 2.0], [3.0, 4.0]],
+    ], dtype=float)
+    weights = np.ones_like(residuals)
+    saturation_mask = np.zeros_like(residuals, dtype=bool)
+    saturation_mask[0, 0, 0] = True
+    effective_flux = np.array([1.0, 10.0])
+
+    coeff, _, _ = builder._fit_flux_coefficients(
+        residuals, weights, effective_flux, flux_degree=0,
+        saturation_mask=saturation_mask)
+
+    assert coeff.shape == (1, 2, 2)
+    assert_allclose(coeff[0, 0, 0], 0.0)
+    assert_allclose(coeff[0, 0, 1], 2.0)
+    assert_allclose(coeff[0, 1, 0], 3.0)
+
+
+def test_variable_epsf_builder_freezes_saturated_fwhm_cells():
+    builder = VariableEPSFBuilder(
+        dependencies=('FWHM',), fit_dependencies=('FWHM',),
+        detector_shape=(10, 10), fwhm_degree=1,
+        fwhm_min_valid_samples=2)
+    residuals = np.array([
+        [[1.0, 2.0], [3.0, 4.0]],
+        [[1.0, 2.0], [3.0, 4.0]],
+    ], dtype=float)
+    weights = np.ones_like(residuals)
+    saturation_mask = np.zeros_like(residuals, dtype=bool)
+    saturation_mask[0, 0, 0] = True
+    effective_fwhm = np.array([1.0, 2.0])
+
+    coeff, _, _ = builder._fit_fwhm_coefficients(
+        residuals, weights, effective_fwhm, fwhm_degree=1,
+        saturation_mask=saturation_mask)
+
+    assert coeff.shape == (1, 2, 2)
+    assert_allclose(coeff[0, 0, 0], 0.0)
+    assert np.isfinite(coeff[0, 0, 1])
+    assert np.isfinite(coeff[0, 1, 0])
 
 
 def test_variable_epsf_builder_select_residual_stars_keeps_empty_selection(monkeypatch):
@@ -408,9 +625,54 @@ def test_variable_epsf_builder_extends_init_model_dependencies():
     assert model.fwhm_scale == init_model.fwhm_scale
 
 
+def test_variable_epsf_builder_preserves_init_model_flux_transform_metadata():
+    coeff_data = np.ones((1, 3, 3), dtype=float)
+    flux_coeff_data = np.full((1, 3, 3), 0.1, dtype=float)
+    init_model = VariableEPSFModel(
+        coeff_data, oversampling=1, detector_shape=(10, 10), degree=0,
+        dependencies=('Position', 'Flux'),
+        flux_coeff_data=flux_coeff_data, flux_degree=1,
+        flux_reference=2.0, flux_scale=3.0,
+        flux_transform='log10',
+        normalize_local_epsf=False)
+
+    builder = VariableEPSFBuilder(
+        dependencies=('FWHM',), fit_dependencies=('FWHM',),
+        oversampling=1, detector_shape=(10, 10), degree=0)
+    model = builder._create_initial_variable_model(
+        EPSFStars([]), init_model=init_model)
+
+    assert model.flux_transform == 'log10'
+    assert model.flux_reference == 2.0
+    assert model.flux_scale == 3.0
+
+
+def test_variable_epsf_builder_zero_initial_spatial_constant():
+    stars = EPSFStars([
+        EPSFStar(np.ones((5, 5), dtype=float), cutout_center=(2.0, 2.0),
+                 origin=(0, 0)),
+        EPSFStar(np.full((5, 5), 2.0, dtype=float), cutout_center=(2.0, 2.0),
+                 origin=(0, 0)),
+    ])
+
+    builder_default = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        oversampling=1, detector_shape=(10, 10), degree=0)
+    model_default = builder_default._create_initial_variable_model(stars)
+
+    builder_zero = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        oversampling=1, detector_shape=(10, 10), degree=0,
+        zero_initial_spatial_constant=True)
+    model_zero = builder_zero._create_initial_variable_model(stars)
+
+    assert np.any(model_default.spatial_coeff_data[0] != 0.0)
+    assert_allclose(model_zero.spatial_coeff_data[0], 0.0)
+
+
 def test_variable_epsf_builder_flux_only_preserves_frozen_terms(monkeypatch):
-    spatial_coeff_data = np.ones((1, 3, 3), dtype=float)
-    fwhm_coeff_data = np.full((1, 3, 3), 0.2, dtype=float)
+    spatial_coeff_data = np.ones((1, 4, 4), dtype=float)
+    fwhm_coeff_data = np.full((1, 4, 4), 0.2, dtype=float)
     init_model = VariableEPSFModel(
         spatial_coeff_data, oversampling=1, detector_shape=(10, 10),
         degree=0, dependencies=('Position', 'FWHM'),
@@ -427,15 +689,16 @@ def test_variable_epsf_builder_flux_only_preserves_frozen_terms(monkeypatch):
     builder = VariableEPSFBuilder(
         dependencies=('Flux',), fit_dependencies=('Flux',), oversampling=1,
         detector_shape=(10, 10), degree=0, maxiters=1,
-        flux_min_valid_samples=1, normalise_epsf=True, recenter_epsf=True,
+        flux_min_valid_samples=1, normalise_epsf=False, recenter_epsf=True,
         use_time_integrated_flux=False)
 
     def fail_spatial_fit(*args, **kwargs):
         raise AssertionError('spatial coefficients should be frozen')
 
-    residuals = np.ones((2, 3, 3), dtype=float) * 0.1
+    residuals = np.ones((2, 4, 4), dtype=float) * 0.1
     weights = np.ones_like(residuals)
     coords = np.zeros_like(residuals)
+    saturation_mask = np.zeros_like(residuals, dtype=bool)
     det_x = np.array([1.0, 2.0])
     det_y = np.array([1.0, 2.0])
     group_id = np.array([0, 1])
@@ -452,10 +715,11 @@ def test_variable_epsf_builder_flux_only_preserves_frozen_terms(monkeypatch):
                         lambda fitted_stars, model: fitted_stars)
     monkeypatch.setattr(builder, '_resample_residuals',
                         lambda fitted_stars, model: (residuals, weights,
-                                                     coords, coords, det_x,
+                                                     coords, coords,
+                                                     saturation_mask, det_x,
                                                      det_y, group_id))
     monkeypatch.setattr(builder, '_compute_trust_map_from_residuals',
-                        lambda residuals, weights: np.ones((3, 3),
+                        lambda residuals, weights: np.ones((4, 4),
                                                            dtype=float))
     monkeypatch.setattr(builder, '_plot_iteration_diagnostics',
                         lambda *args, **kwargs: None)
@@ -465,9 +729,26 @@ def test_variable_epsf_builder_flux_only_preserves_frozen_terms(monkeypatch):
                         lambda *args, **kwargs: None)
     builder.variable_fitter = lambda model, stars: stars
 
-    model, _ = builder.build_epsf(stars, init_model=init_model)
+    with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
+        model, _ = builder.build_epsf(stars, init_model=init_model)
 
     assert model.has_flux_dependency
     assert_allclose(model.spatial_coeff_data, spatial_coeff_data)
     assert_allclose(model.fwhm_coeff_data, fwhm_coeff_data)
-    assert np.any(model.flux_coeff_data != 0.0)
+    assert model.flux_coeff_data is not None
+    assert model.flux_coeff_data.shape == (1, 4, 4)
+
+
+def test_variable_epsf_builder_shift_coefficient_stack_sanitizes_nonfinite():
+    builder = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        oversampling=1, detector_shape=(10, 10), degree=0,
+        recenter_epsf=True)
+    coeff_data = np.ones((1, 4, 4), dtype=float)
+    coeff_data[0, 0, 1] = np.nan
+    coeff_data[0, 1, 2] = np.inf
+    coeff_data[0, 2, 3] = -np.inf
+
+    shifted = builder._shift_coefficient_stack(coeff_data, dx=0.0, dy=0.0)
+
+    assert np.all(np.isfinite(shifted))
