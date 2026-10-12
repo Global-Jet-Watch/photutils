@@ -284,7 +284,8 @@ def test_epsfbuilder_inputs():
     builder = EPSFBuilder(oversampling=6)
     EPSFBuilder(oversampling=[4, 6])
     EPSFBuilder(recenter_epsf=False)
-    EPSFBuilder(clip_negative=False)
+    with pytest.raises(TypeError, match='unexpected keyword argument'):
+        EPSFBuilder(clip_negative=False)
     EPSFBuilder(calibrate_ppe=('Position',))
     EPSFBuilder(constrain_stars=('Position',))
     EPSFBuilder(plot_diagnostics=False)
@@ -317,7 +318,6 @@ def test_epsfbuilder_inputs():
     assert not hasattr(builder, 'flux_ppe_update_every')
     assert not hasattr(builder, '_sigma_clip')
     assert builder.recenter_epsf is True
-    assert builder.clip_negative is True
     assert builder.calibrate_ppe == ('Flux', 'Position')
     assert builder.constrain_stars == ('Flux', 'Position')
     assert builder.plot_diagnostics is True

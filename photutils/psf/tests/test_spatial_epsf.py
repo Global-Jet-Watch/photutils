@@ -12,7 +12,8 @@ from numpy.testing import assert_allclose
 
 from photutils.centroids import centroid_com
 from photutils.psf.spatial_epsf import (SpatialEPSFBuilder, SpatialEPSFFitter,
-                                        SpatialEPSFModel)
+                                        SpatialEPSFModel,
+                                        SpatialPPEMapModel)
 from photutils.psf.epsf_stars import EPSFStar, EPSFStars
 from photutils.psf.image_models import ImagePSF
 
@@ -367,6 +368,88 @@ def test_spatial_epsf_model_local_normalisation_toggle():
     assert total > 1.0
 
 
+@pytest.mark.parametrize(('degree', 'expected'), [
+    (0, [1.0]),
+    (1, [1.0, 0.0, 0.0]),
+    (2, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+])
+def test_spatial_epsf_model_basis_at_detector_center(degree, expected):
+    n_basis = len(expected)
+    model = SpatialEPSFModel(np.ones((n_basis, 3, 3)), oversampling=1,
+                             detector_shape=(11, 21), degree=degree)
+
+    assert_allclose(model.basis_vector(10.0, 5.0), expected)
+
+
+def test_spatial_epsf_model_enforces_nonnegative_values():
+    coeff_data = np.zeros((1, 5, 5), dtype=float)
+    coeff_data[0, 2, 2] = -1.0
+    coeff_data[0, 2, 1] = 1.0
+    model = SpatialEPSFModel(coeff_data, oversampling=1,
+                             detector_shape=(10, 10), degree=0,
+                             normalize_local_epsf=False,
+                             enforce_nonnegative=True)
+
+    local_epsf = model.make_image_psf(5.0, 5.0)
+
+    assert np.all(local_epsf.data >= 0.0)
+    assert local_epsf.data[2, 2] == 0.0
+
+
+@pytest.mark.parametrize('plot_type', ['2d', '3d'])
+def test_spatial_epsf_model_plot_types(plot_type):
+    import matplotlib.pyplot as plt
+
+    model = _make_spatial_model(shape=(5, 5))
+    fig, ax = model.plot_model(25.0, 25.0, plot_type=plot_type,
+                               grid_factor=2)
+    try:
+        assert ax.figure is fig
+        assert ax.get_title() == 'Local ePSF at detector position (25.00, 25.00)'
+    finally:
+        plt.close(fig)
+
+
+def test_spatial_epsf_model_plot_validation_and_trust_map():
+    import matplotlib.pyplot as plt
+
+    model = _make_spatial_model(shape=(5, 5))
+    with pytest.raises(ValueError, match="plot_type must be '2d' or '3d'"):
+        model.plot_model(0.0, 0.0, plot_type='other')
+    with pytest.raises(ValueError, match='grid_factor must be a positive integer'):
+        model.plot_model(0.0, 0.0, grid_factor=0)
+    with pytest.raises(ValueError, match='No trust map available'):
+        model.plot_trust_map()
+
+    model.trust_map = np.ones(model.shape)
+    fig, ax = model.plot_trust_map()
+    try:
+        assert ax.get_title() == 'Trust Map (RMS Residual per Grid Cell)'
+    finally:
+        plt.close(fig)
+
+
+def test_spatial_ppe_model_detector_position_and_broadcasting():
+    # A linear flux correction varies with detector x; position corrections
+    # are constant across detector position.
+    flux_coeff = np.zeros((3, 2, 2), dtype=float)
+    flux_coeff[0] = 0.1
+    flux_coeff[1] = 0.1
+    x_coeff = np.zeros_like(flux_coeff)
+    x_coeff[0] = 0.2
+    y_coeff = np.zeros_like(flux_coeff)
+    y_coeff[0] = -0.1
+    model = SpatialPPEMapModel(flux_coeff, x_coeff, y_coeff,
+                               supersampling=(2, 2),
+                               detector_shape=(11, 21), degree=1)
+
+    left = model(10.0, 0.25, 0.25, det_x=0.0, det_y=5.0)
+    right = model(10.0, 0.5, 0.5, det_x=20.0, det_y=5.0)
+
+    assert_allclose(left, (10.0, 0.05, 0.35))
+    assert_allclose(right, (10.0 / 1.2, 0.3, 0.6))
+
+
 def test_spatial_epsf_builder_auto_quadratic_offset_core_size():
     builder = SpatialEPSFBuilder(detector_shape=(100, 100), oversampling=1,
                                  degree=0)
@@ -400,7 +483,7 @@ def test_spatial_epsf_builder_warns_when_interpolation_not_possible():
         coeff = builder._fit_residual_coefficients(residuals, det_x, det_y)
 
     messages = [str(warning.message) for warning in warning_info]
-    assert any('Interpolation is not possible' in message
+    assert any('Insufficient sources' in message
                for message in messages)
     assert_allclose(coeff, 0.0)
 
@@ -438,6 +521,101 @@ def test_spatial_epsf_builder_skips_underdetermined_residual_solves():
             residuals, det_x, det_y, x_coords=x_coords, y_coords=y_coords)
 
     assert_allclose(coeff, 0.0)
+
+
+def test_spatial_epsf_builder_fits_residual_coefficients_and_masks_saturation():
+    builder = SpatialEPSFBuilder(detector_shape=(10, 10), degree=0,
+                                 residual_min_valid_samples=3,
+                                 residual_outlier_clip=None,
+                                 coefficient_interpolation_method='nearest')
+    residuals = np.array([[[1.0]], [[3.0]], [[9.0]], [[5.0]]])
+    det_x = np.array([1.0, 2.0, 3.0, 4.0])
+    det_y = np.array([1.0, 2.0, 3.0, 4.0])
+    saturation_mask = np.array([[[False]], [[False]], [[True]], [[False]]])
+
+    coeff = builder._fit_residual_coefficients(
+        residuals, det_x, det_y, saturation_mask=saturation_mask)
+
+    assert_allclose(coeff[:, 0, 0], [3.0])
+
+
+def test_spatial_residual_solver_reduces_degree_for_sparse_cells():
+    builder = SpatialEPSFBuilder(
+        detector_shape=(10, 10), degree=2, adaptive_degree_by_cell_samples=True,
+        residual_min_valid_samples=3, residual_outlier_clip=None,
+        coefficient_interpolation_method='nearest')
+    det_x = np.array([0.0, 9.0, 0.0, 9.0])
+    det_y = np.array([0.0, 0.0, 9.0, 9.0])
+    residuals = (1.0 + 2.0 * (2 * det_x / 9.0 - 1.0)
+                 + 3.0 * (2 * det_y / 9.0 - 1.0))[:, None, None]
+
+    coeff = builder._fit_residual_coefficients(residuals, det_x, det_y)
+
+    assert_allclose(coeff[:, 0, 0], [1.0, 2.0, 3.0, 0.0, 0.0, 0.0])
+
+
+def test_spatial_residual_solver_applies_ridge_regularization():
+    builder = SpatialEPSFBuilder(detector_shape=(10, 10), degree=0,
+                                 residual_min_valid_samples=3,
+                                 residual_ridge_lambda=1.0,
+                                 residual_outlier_clip=None)
+    residuals = np.array([[[1.0]], [[2.0]], [[3.0]]])
+    det_x = np.array([1.0, 5.0, 9.0])
+    det_y = np.array([1.0, 5.0, 9.0])
+
+    coeff = builder._fit_residual_coefficients(residuals, det_x, det_y)
+
+    assert_allclose(coeff[:, 0, 0], [1.5])
+
+
+def test_spatial_residual_solver_protects_saturated_grid_sections():
+    builder = SpatialEPSFBuilder(detector_shape=(10, 10), degree=0,
+                                 residual_min_valid_samples=2,
+                                 residual_outlier_clip=None)
+    builder.exclude_any_saturated_gridcell = True
+    residuals = np.ones((3, 1, 1), dtype=float)
+    saturation_mask = np.zeros_like(residuals, dtype=bool)
+    saturation_mask[0, 0, 0] = True
+
+    coeff = builder._fit_residual_coefficients(
+        residuals, np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 3.0]),
+        saturation_mask=saturation_mask)
+
+    assert_allclose(coeff, 0.0)
+
+
+def test_spatial_epsf_builder_runs_one_build_iteration():
+    y, x = np.indices((7, 7), dtype=float)
+    profile = np.exp(-((x - 3.0)**2 + (y - 3.0)**2) / 2.0)
+    stars = EPSFStars([
+        EPSFStar(profile.copy(), cutout_center=(3.0, 3.0)),
+        EPSFStar(profile.copy(), cutout_center=(3.0, 3.0)),
+        EPSFStar(profile.copy(), cutout_center=(3.0, 3.0)),
+    ])
+    builder = SpatialEPSFBuilder(
+        detector_shape=(20, 20), oversampling=2, degree=0, maxiters=1,
+        fitter=SpatialEPSFFitter(fitter=_ShiftFitter([0.0]),
+                                 fit_boxsize=None),
+        smoothing_kernel=None, residual_smoothing_kernel=None,
+        residual_min_valid_samples=1, residual_outlier_clip=None,
+        calibrate_ppe=(), constrain_stars=(), recenter_epsf=False,
+        normalise_epsf=False)
+
+    with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
+        model, fitted_stars = builder.build_epsf(stars)
+
+    assert isinstance(model, SpatialEPSFModel)
+    assert model.coeff_data.shape == (1, 15, 15)
+    assert len(builder._models) == 1
+    assert len(fitted_stars) == len(stars)
+
+    initial_coeff = model.coeff_data.copy()
+    with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
+        refined_model, refined_stars = builder.build_epsf(
+            fitted_stars, init_model=model)
+    assert isinstance(refined_model, SpatialEPSFModel)
+    assert len(refined_stars) == len(stars)
+    assert_allclose(model.coeff_data, initial_coeff)
 
 
 def test_spatial_epsf_builder_residual_outlier_clip_validation():

@@ -8,7 +8,8 @@ import pytest
 from numpy.testing import assert_allclose
 
 from photutils.psf.epsf import EPSFFitter
-from photutils.psf.epsf_model_error import EPSFErrorMap, calc_epsf_error
+from photutils.psf.epsf_model_error import (_NonnegativeImageInterpolator,
+                                            EPSFErrorMap, calc_epsf_error)
 from photutils.psf.epsf_stars import EPSFStar, EPSFStars, LinkedEPSFStar
 from photutils.psf.gridded_epsf import GriddedEPSFFitter
 from photutils.psf.gridded_models import GriddedPSFModel
@@ -94,6 +95,34 @@ def test_calc_epsf_error_excludes_zero_weight_samples():
     assert_allclose(error_map.mean_residual[2, 2], 0.1)
 
 
+def test_calc_epsf_error_skips_zero_flux_and_masked_samples():
+    epsf = ImagePSF(np.zeros((5, 5), dtype=float), oversampling=1)
+    data = np.ones((3, 3), dtype=float)
+    star = EPSFStar(data, cutout_center=(1.0, 1.0))
+    star.flux = 0.0
+    error_map = calc_epsf_error(epsf, EPSFStars([star]), fit_stars=False)
+
+    assert_allclose(error_map.data, 0.0)
+    assert error_map.n_samples.sum() == 0
+    assert error_map.fit_uncertainties == {
+        'sigma_flux': [], 'sigma_x': [], 'sigma_y': []}
+
+
+def test_calc_epsf_error_propagates_fit_covariance():
+    epsf = ImagePSF(np.zeros((5, 5), dtype=float), oversampling=1)
+    star = EPSFStar(np.ones((3, 3), dtype=float),
+                    cutout_center=(1.0, 1.0))
+    star.flux = 2.0
+    star._fit_info = {'param_cov': np.diag([0.04, 0.09, 0.16])}
+
+    error_map = calc_epsf_error(epsf, EPSFStars([star]), fit_stars=False,
+                                forced_photometry=False, min_samples=1)
+
+    assert_allclose(error_map.fit_uncertainties['sigma_flux'], [0.1])
+    assert_allclose(error_map.fit_uncertainties['sigma_x'], [0.3])
+    assert_allclose(error_map.fit_uncertainties['sigma_y'], [0.4])
+
+
 def test_calc_epsf_error_inputs():
     epsf = ImagePSF(np.zeros((5, 5), dtype=float), oversampling=2)
 
@@ -116,6 +145,30 @@ def test_epsf_error_map_variance_interpolation_is_nonnegative():
     x = np.linspace(-1.0, 1.0, 41)
     xx, yy = np.meshgrid(x, x)
     assert np.all(error_map.evaluate_variance(xx, yy) >= 0.0)
+
+
+@pytest.mark.parametrize(('data', 'x', 'y', 'expected'), [
+    (np.array([[2.0]]), np.array([[-1.0, 0.5, 2.0]]),
+     np.array([[0.0, 0.0, 0.0]]), [[2.0, 2.0, 2.0]]),
+    (np.array([[0.0], [2.0]]), np.array([[0.0, 0.0]]),
+     np.array([[0.5, 1.5]]), [[1.0, 2.0]]),
+    (np.array([[0.0, 2.0]]), np.array([[0.5, 1.5]]),
+     np.array([[0.0, 0.0]]), [[1.0, 2.0]]),
+])
+def test_nonnegative_variance_interpolator_singleton_axes(data, x, y,
+                                                          expected):
+    interpolator = _NonnegativeImageInterpolator(data)
+
+    values = interpolator.evaluate(x, y)
+
+    assert_allclose(values, expected)
+    assert np.all(values >= 0.0)
+
+
+@pytest.mark.parametrize('data', [np.ones(3), np.empty((0, 2))])
+def test_nonnegative_variance_interpolator_rejects_invalid_images(data):
+    with pytest.raises(ValueError, match='non-empty 2D array'):
+        _NonnegativeImageInterpolator(data)
 
 
 def test_forced_photometry_preserves_model_parameter_state():
