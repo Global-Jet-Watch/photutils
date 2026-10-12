@@ -494,6 +494,7 @@ class EPSFBuilder:
             msg = 'fitter must be an EPSFFitter instance'
             raise TypeError(msg)
         self.fitter = fitter
+        self.current_epsf = None
 
         if center_accuracy <= 0.0:
             msg = 'center_accuracy must be a positive number'
@@ -1136,13 +1137,14 @@ class EPSFBuilder:
         # TEMP: Plot the hot mask for diagnostics
         if self.plot_diagnostics:
             import matplotlib.pyplot as plt
-            plt.figure(figsize=(6, 6))
-            plt.imshow(hot_mask, origin='lower', cmap='Reds')
-            plt.title('Hot Residual Mask')
-            plt.xlabel('X Pixel Index')
-            plt.ylabel('Y Pixel Index')
-            plt.colorbar(label='Hot Mask Value')
-            plt.show()
+            fig, ax = plt.subplots(figsize=(6, 6))
+            ax.imshow(hot_mask, origin='lower', cmap='Reds')
+            ax.set_title('Hot Residual Mask')
+            ax.set_xlabel('X Pixel Index')
+            ax.set_ylabel('Y Pixel Index')
+            fig.colorbar(ax.images[0], ax=ax, label='Hot Mask Value')
+            if not plt.isinteractive():
+                plt.close(fig)
 
         return despiked
 
@@ -1190,7 +1192,8 @@ class EPSFBuilder:
             fig.colorbar(im, ax=ax, label='Residual Value')
 
         fig.suptitle('Combined Residual Stacks by Image Region')
-        plt.show()
+        if not plt.isinteractive():
+            plt.close(fig)
 
     def _plot_residual_flux_stacks(self, stack_stars, residuals, weights,
                                    x_coords, y_coords):
@@ -1244,7 +1247,8 @@ class EPSFBuilder:
             fig.colorbar(im, ax=ax, label='Residual Value')
 
         fig.suptitle('Combined Residual Stacks by Flux Bin')
-        plt.show()
+        if not plt.isinteractive():
+            plt.close(fig)
 
     def _build_epsf_step(self, stars, epsf=None, *, iter_num=None):
         """
@@ -1588,6 +1592,8 @@ class EPSFBuilder:
                 ax.set_ylabel('Subpixel y phase')
                 fig.colorbar(im, ax=ax, label=cbar_label)
 
+        if not plt.isinteractive():
+            plt.close(fig)
         return fig
 
     def _plot_diagnostics(self, stars, ppe_map):
@@ -1597,8 +1603,12 @@ class EPSFBuilder:
         if not self.plot_diagnostics:
             return None
 
-        ppe_map.plot_maps()
-        return self._plot_ppe_region_diagnostics(stars)
+        fig = ppe_map.plot_maps()
+        region_fig = self._plot_ppe_region_diagnostics(stars)
+        if not plt.isinteractive():
+            plt.close(fig)
+            plt.close(region_fig)
+        return region_fig
     
     def _plot_star_distribution(self, stars):
         """
@@ -1606,6 +1616,8 @@ class EPSFBuilder:
         """
         if not self.plot_diagnostics:
             return None
+
+        import matplotlib.pyplot as plt
 
         # Plot 1: Star sample distributions
         fig, axes = plt.subplots(1, 4, figsize=(20, 5))
@@ -1677,7 +1689,9 @@ class EPSFBuilder:
         axes[3].set_ylabel('Sub-Pixel Y Bin')
         cbar = fig.colorbar(im, ax=axes[3])
         cbar.set_label('Number of Unique Star IDs')
-        plt.show()
+        if not plt.isinteractive():
+            plt.close(fig)
+        return fig
 
     def _plot_residual_image(self, residuals):
         """
@@ -1688,13 +1702,14 @@ class EPSFBuilder:
 
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(6, 6))
-        plt.imshow(residuals, origin='lower', cmap='coolwarm')
-        plt.title('Combined Residual Image')
-        plt.xlabel('X Pixel Index')
-        plt.ylabel('Y Pixel Index')
-        plt.colorbar(label='Residual Value')
-        plt.show()
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(residuals, origin='lower', cmap='coolwarm')
+        ax.set_title('Combined Residual Image')
+        ax.set_xlabel('X Pixel Index')
+        ax.set_ylabel('Y Pixel Index')
+        fig.colorbar(im, ax=ax, label='Residual Value')
+        if not plt.isinteractive():
+            plt.close(fig)
 
     def _plot_epsf(self, epsf):
         """
@@ -1705,13 +1720,14 @@ class EPSFBuilder:
 
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(6, 6))
-        plt.imshow(epsf.data, origin='lower', cmap='viridis')
-        plt.title('ePSF Image')
-        plt.xlabel('X Pixel Index')
-        plt.ylabel('Y Pixel Index')
-        plt.colorbar(label='ePSF Value')
-        plt.show()
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(epsf.data, origin='lower', cmap='viridis')
+        ax.set_title('ePSF Image')
+        ax.set_xlabel('X Pixel Index')
+        ax.set_ylabel('Y Pixel Index')
+        fig.colorbar(im, ax=ax, label='ePSF Value')
+        if not plt.isinteractive():
+            plt.close(fig)
 
     def _correct_stars_ppe(self, stars, ppe_map, *, apply_flux=True,
                            apply_position=True, flux_damping=1.0):
@@ -2145,4 +2161,4 @@ class PPEMap:
             ax.set_ylabel('Subpixel y phase')
             fig.colorbar(im, ax=ax, label=cbar_label)
 
-        plt.show()
+        return fig
