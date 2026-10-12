@@ -128,8 +128,10 @@ class _ModelGridPlotter:
                     and self.model.meta.get('detector', '') == 'NRCSW'):
                 figsize = (20, 8)
             fig, ax = plt.subplots(figsize=figsize)
+            close_fig = not plt.isinteractive()
         else:
             fig = plt.gcf()
+            close_fig = False
 
         if peak_norm and data.max() != 0:
             # normalize relative to peak
@@ -237,5 +239,8 @@ class _ModelGridPlotter:
                             verticalalignment='top', fontsize=12)
 
         fig.tight_layout()
+
+        if close_fig:
+            plt.close(fig)
 
         return fig

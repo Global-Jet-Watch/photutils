@@ -5,6 +5,7 @@ photometry.
 """
 
 from .epsf import *  # noqa: F401, F403
+from .epsf_model_error import *  # noqa: F401, F403
 from .epsf_stars import *  # noqa: F401, F403
 from .flags import *  # noqa: F401, F403
 from .functional_models import *  # noqa: F401, F403
@@ -19,3 +20,6 @@ from .photometry import *  # noqa: F401, F403
 from .simulation import *  # noqa: F401, F403
 from .utils import *  # noqa: F401, F403
 from .fitters import *  # noqa: F401, F403
+from .spatial_epsf import *  # noqa: F401, F403
+from .gridded_epsf import *  # noqa: F401, F403
+from .variable_epsf import *  # noqa: F401, F403

@@ -1,5 +1,55 @@
-3.0.0 (unreleased)
-------------------
+Team fork development (unreleased)
+----------------------------------
+
+These changes are maintained on the team fork and are not part of an
+official Photutils release.
+
+New Features
+^^^^^^^^^^^^
+
+- ``photutils.psf``
+
+  - Added ``GriddedEPSFBuilder`` and ``GriddedEPSFFitter`` for building
+    and fitting spatially varying ePSFs on a detector grid.
+
+  - Added ``SpatialEPSFBuilder`` and ``SpatialEPSFModel`` for modeling
+    smoothly varying ePSFs with low-order detector-position polynomials.
+
+  - Added the experimental ``VariableEPSFBuilder`` and
+    ``VariableEPSFModel`` for ePSFs that can vary with detector position,
+    source flux, and image FWHM.
+
+  - Added pixel-phase error (PPE) calibration and controls for linked-star
+    constraints, residual rejection, and coefficient fitting in the new
+    ePSF builders.
+
+  - Added ``EPSFErrorMap`` and ``calc_epsf_error`` to estimate ePSF model
+    uncertainty from stellar residuals, including support for gridded,
+    spatial, and variable models.
+
+  - Added forced photometry for gridded, spatial, and variable ePSF
+    fitting, holding linked-star positions fixed while fitting fluxes.
+
+Bug Fixes
+^^^^^^^^^
+
+- ``photutils.psf``
+
+  - Corrected forced photometry for supported PSF model types, improved
+    handling of saturated stars and fit uncertainties, and made spatial
+    coefficient interpolation preserve non-negativity when requested.
+
+  - Avoided sharing mutable default fitter state between
+    ``EPSFBuilder`` instances and made diagnostic plotting work with
+    non-interactive Matplotlib backends.
+
+- ``photutils.utils``
+
+  - Corrected overlap-slice handling for array cutouts.
+
+
+3.0.0 (fork baseline; released upstream 2026-04-17)
+---------------------------------------------------
 
 General
 ^^^^^^^

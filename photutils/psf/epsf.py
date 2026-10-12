@@ -12,25 +12,22 @@ from functools import partial
 from astropy.modeling.fitting import TRFLSQFitter
 from astropy.nddata.utils import NoOverlapError, PartialOverlapError
 from astropy.convolution import Gaussian2DKernel
-from astropy.stats import SigmaClip, sigma_clipped_stats
+from astropy.stats import sigma_clipped_stats
 from astropy.utils.exceptions import AstropyUserWarning
-from scipy.ndimage import convolve, label
+from scipy.ndimage import convolve, label, median_filter
+from scipy.spatial import QhullError
 
 from photutils.centroids import centroid_com
 from photutils.psf.epsf_stars import EPSFStar, EPSFStars, LinkedEPSFStar
 from photutils.psf.image_models import ImagePSF, _LegacyEPSFModel
 from photutils.psf.utils import _interpolate_missing_data
-from photutils.utils._parameters import (SigmaClipSentinelDefault, as_pair,
-                                         create_default_sigmaclip)
+from photutils.utils._parameters import as_pair
 from photutils.utils._progress_bars import add_progress_bar
 from photutils.utils._round import py2intround
 from photutils.utils._stats import nanmedian
 from photutils.utils.cutouts import _overlap_slices as overlap_slices
 
-__all__ = ['EPSFBuilder', 'EPSFFitter']
-
-
-SIGMA_CLIP = SigmaClipSentinelDefault(sigma=3.0, maxiters=10)
+__all__ = ['EPSFBuilder', 'EPSFFitter', 'PPEMap']
 
 
 class EPSFFitter:
@@ -60,7 +57,7 @@ class EPSFFitter:
         of the input ``fitter``.
     """
 
-    def __init__(self, *, fitter=None, fit_boxsize=5,
+    def __init__(self, *, fitter=None, fit_boxsize=3,
                  **fitter_kwargs):
 
         if fitter is None:
@@ -81,7 +78,7 @@ class EPSFFitter:
                 del fitter_kwargs[kwarg]
         self.fitter_kwargs = fitter_kwargs
 
-    def __call__(self, epsf, stars):
+    def __call__(self, epsf, stars, *, epsf_error_map=None):
         """
         Fit an ePSF model to stars.
 
@@ -95,6 +92,10 @@ class EPSFFitter:
             should be as close as possible to actual centers. For stars
             than contain weights, a weighted fit of the ePSF to the star
             will be performed.
+
+        epsf_error_map : `EPSFErrorMap`, optional
+            An ePSF error map used to augment the pixel weights with an
+            extra model-noise term in data units.
 
         Returns
         -------
@@ -110,6 +111,12 @@ class EPSFFitter:
             msg = 'The input epsf must be an ImagePSF'
             raise TypeError(msg)
 
+        if epsf_error_map is not None:
+            from photutils.psf.epsf_model_error import EPSFErrorMap
+            if not isinstance(epsf_error_map, EPSFErrorMap):
+                msg = 'epsf_error_map must be an EPSFErrorMap instance'
+                raise TypeError(msg)
+
         # perform the fit
         fitted_stars = []
         for star in stars:
@@ -119,7 +126,8 @@ class EPSFFitter:
                 fitted_star = self._fit_star(_epsf, star, self.fitter,
                                              self.fitter_kwargs,
                                              self.fitter_has_fit_info,
-                                             self.fit_boxsize)
+                                             self.fit_boxsize,
+                                             epsf_error_map=epsf_error_map)
 
             elif isinstance(star, LinkedEPSFStar):
                 fitted_star = []
@@ -130,7 +138,8 @@ class EPSFFitter:
                         self._fit_star(_epsf, linked_star, self.fitter,
                                        self.fitter_kwargs,
                                        self.fitter_has_fit_info,
-                                       self.fit_boxsize))
+                                       self.fit_boxsize,
+                                       epsf_error_map=epsf_error_map))
 
                 fitted_star = LinkedEPSFStar(fitted_star)
 
@@ -144,7 +153,7 @@ class EPSFFitter:
         return EPSFStars(fitted_stars)
 
     def _fit_star(self, epsf, star, fitter, fitter_kwargs,
-                  fitter_has_fit_info, fit_boxsize):
+                  fitter_has_fit_info, fit_boxsize, *, epsf_error_map=None):
         """
         Fit an ePSF model to a single star.
 
@@ -183,6 +192,10 @@ class EPSFFitter:
             # define the origin of the fitting region
             x0 = 0
             y0 = 0
+
+        if epsf_error_map is not None:
+            weights = self._augment_weights_with_epsf_error(
+                weights, star, data.shape, x0, y0, epsf_error_map)
 
         # Define positions in the undersampled grid. The fitter will
         # evaluate on the defined interpolation grid, currently in the
@@ -229,10 +242,76 @@ class EPSFFitter:
 
         return star
 
+    def _augment_weights_with_epsf_error(
+        self,
+        weights,
+        star,
+        data_shape,
+        x0,
+        y0,
+        epsf_error_map,
+    ):
+        """
+        Add ePSF model-error variance to the fit weights.
+
+        Parameters
+        ----------
+        weights : ndarray
+            Existing inverse-standard-deviation weights (1/sigma).
+
+        Returns
+        -------
+        augmented_weights : ndarray
+            Updated inverse-standard-deviation weights.
+        """
+        yy, xx = np.indices(data_shape, dtype=float)
+
+        # detector-pixel offsets relative to fitted centroid
+        xx = xx + x0 - star.cutout_center[0]
+        yy = yy + y0 - star.cutout_center[1]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # recover variance from inverse-sigma weights
+            data_variance = 1.0 / np.square(weights)
+
+            # variance of normalized ePSF model
+            epsf_error_variance = epsf_error_map.evaluate_variance(
+                xx,
+                yy,
+            )
+
+            epsf_error_variance = np.asarray(
+                epsf_error_variance,
+                dtype=float,
+            )
+
+            epsf_error_variance = np.where(
+                np.isfinite(epsf_error_variance),
+                epsf_error_variance,
+                0.0,
+            )
+
+            # convert normalized-ePSF variance into data units
+            model_variance = star.flux**2 * epsf_error_variance
+
+            total_variance = data_variance + model_variance
+
+            augmented_weights = 1.0 / np.sqrt(total_variance)
+
+        augmented_weights = np.asarray(
+            augmented_weights,
+            dtype=float,
+        )
+
+        augmented_weights[~np.isfinite(augmented_weights)] = 0.0
+        augmented_weights[weights <= 0.0] = 0.0
+
+        return augmented_weights
+
 
 class EPSFBuilder:
     """
-    Class to build an effective PSF (ePSF).
+    Build an effective PSF (ePSF) from stellar cutouts.
 
     See `Anderson and King (2000; PASP 112, 1360)
     <https://ui.adsabs.harvard.edu/abs/2000PASP..112.1360A/abstract>`_
@@ -252,107 +331,96 @@ class EPSFBuilder:
         elements, they must be in ``(y, x)`` order.
 
     shape : float, tuple of two floats, or `None`, optional
-        The shape of the output ePSF. If the ``shape`` is not `None`, it
-        will be derived from the sizes of the input ``stars`` and the
-        ePSF oversampling factor. If the size is even along any axis,
-        it will be made odd by adding one. The output ePSF will always
-        have odd sizes along both axes to ensure a well-defined central
-        pixel.
-
-    smoothing_kernel : {'quartic', 'quadratic'}, 2D `~numpy.ndarray`, or `None`
-        The smoothing kernel to apply to the ePSF. The predefined
-        ``'quartic'`` and ``'quadratic'`` kernels are derived
-        from fourth and second degree polynomials, respectively.
-        Alternatively, a custom 2D array can be input. If `None` then no
-        smoothing will be performed.
-
-    residual_smoothing_kernel : {'gaussian'}, 2D `~numpy.ndarray`, or `None`
-        The smoothing kernel to apply to the ePSF residuals. The only
-        predefined option is ``'gaussian'``, which applies a Gaussian
-        smoothing kernel. Alternatively, a custom 2D array can be input. If
-        `None` then no smoothing of the residuals will be performed.
-
-    recentering_func : callable, optional
-        A callable object (e.g., function or class) that is used to
-        calculate the centroid of a 2D array. The callable must accept
-        a 2D `~numpy.ndarray`, have a ``mask`` keyword and optionally
-        ``error`` and ``oversampling`` keywords. The callable object
-        must return a tuple of two 1D `~numpy.ndarray` variables,
-        representing the x and y centroids.
-
-    recentering_maxiters : int, optional
-        The maximum number of recentering iterations to perform during
-        each ePSF build iteration.
-
-    fitter : `EPSFFitter` object, optional
-        A `EPSFFitter` object use to fit the ePSF to stars. If `None`,
-        then the default `EPSFFitter` will be used. To set custom fitter
-        options, input a new `EPSFFitter` object. See the `EPSFFitter`
-        documentation for options.
-
-    maxiters : int, optional
-        The maximum number of iterations to perform.
-
-    progress_bar : bool, option
-        Whether to print the progress bar during the build
-        iterations. The progress bar requires that the `tqdm
-        <https://tqdm.github.io/>`_ optional dependency be installed.
-
-    normalise_epsf : bool, optional
-        If `True`, the ePSF will be normalized after each iteration.
-        Default is `True`.
-
-    norm_radius : float, optional
-        The pixel radius over which the ePSF is normalized.
-
-    recentering_boxsize : float or tuple of two floats, optional
-        The size (in pixels) of the box used to calculate the centroid
-        of the ePSF during each build iteration. If a single integer
-        number is provided, then a square box will be used. If two
-        values are provided, then they must be in ``(ny, nx)`` order.
-        ``recentering_boxsize`` must have odd values and be greater than
-        or equal to 3 for both axes.
-
-    center_accuracy : float, optional
-        The desired accuracy for the centers of stars. The building
-        iterations will stop if the centers of all the stars change by
-        less than ``center_accuracy`` pixels between iterations. All
-        stars must meet this condition for the loop to exit.
-
-    sigma_clip : `astropy.stats.SigmaClip` instance, optional
-        A `~astropy.stats.SigmaClip` object that defines the sigma
-        clipping parameters used to determine which pixels are ignored
-        when stacking the ePSF residuals in each iteration step. If
-        `None` then no sigma clipping will be performed.
+        The output ePSF shape. If `None`, the shape is derived from the
+        input stars and ``oversampling``. Even sizes are promoted to the
+        next odd value so the ePSF has a well-defined central pixel.
 
     epsf_class : subclass of `ImagePSF`, optional
-        A subclass of `ImagePSF` to use for the ePSF for using alternative
-        interpolation methods between gridpoints. If `None`, then the
-        default `ImagePSF` class will be used.
+        The `ImagePSF` subclass used for constructed ePSF models.
 
-    gridpoint_estimation : {'mean', 'median', 'weighted_mean', 'polyfit'}, 
-                            optional
-        The method used to estimate the value of each ePSF gridpoint. The 
-        default option is 'polyfit'. The
-        options are:
-        'mean' : Use the sigma-clipped mean of all the contributing pixel 
-        values.
-        'median' : Use the sigma-clipped median of all the contributing pixel 
-        values.
-        'weighted_mean' : Use the sigma-clipped weighted mean of all the contributing pixel values, where the weights are determined by the distance of each pixel from the gridpoint.
-        'polyfit' : Use a polynomial fit over the contributing pixel values to estimate the value of each ePSF gridpoint.
+    fitter : `EPSFFitter` object, optional
+        The fitter used to refit the ePSF to the stars after each build
+        iteration. If `None`, a default `EPSFFitter` is created.
 
-    epsf_nonnegative : bool, optional
-        If `True`, any negative values in the ePSF will be set to zero
-        after each iteration. Default is `True`.
+    maxiters : int, optional
+        The maximum number of build iterations.
 
-    mask_background_pixels : bool, optional
-        If `True`, pixels that are likely to be background (not part of
-        the star) will be masked when calculating the ePSF residuals.
-        This is done by thresholding the star image based on its
-        sigma-clipped statistics, labeling the sources above the
-        threshold, and masking all but the largest source. Default is
+    progress_bar : bool, optional
+        Whether to display a progress bar during the iterative build.
+
+    smoothing_kernel : {'quartic', 'quadratic'}, 2D `~numpy.ndarray`, or `None`
+        The smoothing kernel applied to the ePSF after each residual
+        update. The predefined ``'quartic'`` and ``'quadratic'`` kernels
+        are derived from fourth- and second-degree polynomials,
+        respectively. A custom 2D kernel array may also be supplied.
+
+    residual_smoothing_kernel : {'gaussian'}, 2D `~numpy.ndarray`, or `None`
+        The smoothing kernel applied to the stacked residual image
+        before it is added back into the ePSF. The predefined
+        ``'gaussian'`` option uses a Gaussian kernel matched to the
+        oversampled grid.
+
+    recenter_epsf : bool, optional
+        Whether to recenter the ePSF after each build iteration. The
+        recentering step always uses `centroid_com`, derives its box
+        size from the ePSF shape, and runs for at most 10 iterations.
+
+    normalise_epsf : bool, optional
+        Whether to normalize the ePSF after each build iteration.
+
+    center_accuracy : float, optional
+        The convergence threshold in pixels for fitted star centers. The
+        build stops when every successfully fit star moves by less than
+        this amount between successive iterations.
+
+    gridpoint_estimation : {'mean', 'median', 'weighted_mean', 'polyfit'}, optional
+        The estimator used to combine residual samples in each
+        oversampled ePSF grid cell.
+
+    edge_clip : int, optional
+        The number of oversampled pixels to zero around the ePSF border
+        after each iteration.
+
+    calibrate_ppe : tuple of {'Flux', 'Position'}, optional
+        Which PPE calibrations to apply. Include ``'Flux'`` to enable
+        in-loop and final flux PPE calibration and ``'Position'`` to
+        enable position PPE calibration.
+
+    constrain_stars : tuple of {'Flux', 'Position'}, optional
+        Which linked-star constraints to apply after each fitting step.
+        Include ``'Flux'`` to constrain linked-star fluxes and
+        ``'Position'`` to constrain linked-star positions.
+
+    plot_diagnostics : bool, optional
+        Whether to show diagnostic PPE and residual plots.
+
+    residual_star_rms_clip : float or `None`, optional
+        Threshold for rejecting whole stars from the residual stack
+        based on normalized residual RMS. If `None`, no whole-star
+        clipping is applied.
+
+    residual_outlier_clip : float or `None`, optional
+        Threshold for rejecting outlying residual samples within each
+        oversampled grid cell using a MAD-based clip. If `None`, no
+        per-gridpoint clipping is applied.
+
+    residual_min_valid_samples : int, optional
+        Minimum number of valid residual samples required to update an
+        oversampled grid cell.
+
+    interpolate_missing_pixels : bool, optional
+        Whether to interpolate residual values for oversampled pixels
+        with fewer than ``residual_min_valid_samples`` samples from
+        nearby valid pixels. If `False`, missing residual values are set
+        to zero, leaving those pixels unchanged for that iteration.
+
+    pixel_interpolation_method : {'cubic', 'nearest'}, optional
+        Interpolation method used when ``interpolate_missing_pixels`` is
         `True`.
+
+    residual_despike : bool, optional
+        Whether to apply a local despiking step to the stacked residual
+        image before smoothing and updating the ePSF.
 
 
     Notes
@@ -363,25 +431,32 @@ class EPSFBuilder:
     .. _bottleneck:  https://github.com/pydata/bottleneck
     """
 
-    def __init__(self, *, 
-                 oversampling=4, 
+    def __init__(self, *,
+                 oversampling=4,
                  shape=None,
-                 smoothing_kernel='quartic', 
-                 residual_smoothing_kernel='gaussian',
-                 recentering_func=centroid_com,
-                 recentering_maxiters=20, 
-                 fitter=None, 
+                 epsf_class=ImagePSF,
+                 fitter=None,
                  maxiters=10,
-                 progress_bar=True, 
-                 normalise_epsf=True,
-                 norm_radius=5.5,
-                 recentering_boxsize=(5, 5), 
+                 progress_bar=True,
                  center_accuracy=1.0e-3,
-                 sigma_clip=SIGMA_CLIP, 
-                 epsf_class=ImagePSF, 
-                 gridpoint_estimation='polyfit', 
-                 epsf_nonnegative=True, 
-                 mask_background_pixels=True):
+                 gridpoint_estimation='polyfit',
+                 smoothing_kernel='quartic',
+                 residual_smoothing_kernel='gaussian',
+                 recenter_epsf=True,
+                 normalise_epsf=True,
+                 edge_clip=1,
+                 calibrate_ppe=('Flux', 'Position'),
+                 constrain_stars=('Flux', 'Position'),
+                 residual_star_rms_clip=3.0,
+                 residual_outlier_clip=3.0,
+                 residual_min_valid_samples=5,
+                 interpolate_missing_pixels=True,
+                 pixel_interpolation_method='cubic',
+                 residual_despike=True,
+                 plot_diagnostics=True,):
+
+        if fitter is None:
+            fitter = EPSFFitter()
 
         if oversampling is None:
             msg = "'oversampling' must be specified"
@@ -389,17 +464,12 @@ class EPSFBuilder:
         self.oversampling = as_pair('oversampling', oversampling,
                                     lower_bound=(0, 1))
         self.normalise_epsf = bool(normalise_epsf)
-        self._norm_radius = norm_radius
         if shape is not None:
             self.shape = as_pair('shape', shape, lower_bound=(0, 1))
         else:
             self.shape = shape
 
-        self.recentering_func = recentering_func
-        self.recentering_maxiters = recentering_maxiters
-        self.recentering_boxsize = as_pair('recentering_boxsize',
-                                           recentering_boxsize,
-                                           lower_bound=(3, 0), check_odd=True)
+        self.recenter_epsf = bool(recenter_epsf)
         self.smoothing_kernel = smoothing_kernel
 
         if residual_smoothing_kernel == 'gaussian':
@@ -424,6 +494,7 @@ class EPSFBuilder:
             msg = 'fitter must be an EPSFFitter instance'
             raise TypeError(msg)
         self.fitter = fitter
+        self.current_epsf = None
 
         if center_accuracy <= 0.0:
             msg = 'center_accuracy must be a positive number'
@@ -437,14 +508,6 @@ class EPSFBuilder:
         self.maxiters = maxiters
 
         self.progress_bar = progress_bar
-
-        if sigma_clip is SIGMA_CLIP:
-            sigma_clip = create_default_sigmaclip(sigma=SIGMA_CLIP.sigma,
-                                                  maxiters=SIGMA_CLIP.maxiters)
-        if not isinstance(sigma_clip, SigmaClip):
-            msg = 'sigma_clip must be an astropy.stats.SigmaClip instance'
-            raise TypeError(msg)
-        self._sigma_clip = sigma_clip
 
         self.epsf_class = epsf_class
         if isinstance(self.epsf_class, partial):
@@ -461,12 +524,64 @@ class EPSFBuilder:
             msg = ("gridpoint_estimation must be one of 'mean', 'median', "
                    "'weighted_mean', 'polyfit'")
             raise ValueError(msg)
-        
-        self.epsf_nonnegative = bool(epsf_nonnegative)
-        self.mask_background_pixels = bool(mask_background_pixels)
 
-        # store each ePSF build iteration
-        self._epsf = []
+        self.edge_clip = int(edge_clip)
+
+        if isinstance(calibrate_ppe, str):
+            calibrate_ppe = (calibrate_ppe,)
+        try:
+            calibrate_ppe = tuple(calibrate_ppe)
+        except TypeError as exc:
+            raise TypeError('calibrate_ppe must be an iterable containing '
+                            "'Flux' and/or 'Position'") from exc
+
+        allowed_ppe = {'Flux', 'Position'}
+        invalid_ppe = [item for item in calibrate_ppe if item not in allowed_ppe]
+        if invalid_ppe:
+            raise ValueError("calibrate_ppe entries must be 'Flux' and/or "
+                             "'Position'")
+        self.calibrate_ppe = tuple(dict.fromkeys(calibrate_ppe))
+
+        if isinstance(constrain_stars, str):
+            constrain_stars = (constrain_stars,)
+        try:
+            constrain_stars = tuple(constrain_stars)
+        except TypeError as exc:
+            raise TypeError('constrain_stars must be an iterable containing '
+                            "'Flux' and/or 'Position'") from exc
+
+        allowed_constraints = {'Flux', 'Position'}
+        invalid_constraints = [item for item in constrain_stars
+                               if item not in allowed_constraints]
+        if invalid_constraints:
+            raise ValueError("constrain_stars entries must be 'Flux' and/or "
+                             "'Position'")
+        self.constrain_stars = tuple(dict.fromkeys(constrain_stars))
+        self.plot_diagnostics = bool(plot_diagnostics)
+
+        if residual_star_rms_clip is not None and residual_star_rms_clip <= 0:
+            msg = 'residual_star_rms_clip must be positive or None'
+            raise ValueError(msg)
+        self.residual_star_rms_clip = residual_star_rms_clip
+
+        if residual_outlier_clip is not None and residual_outlier_clip <= 0:
+            msg = 'residual_outlier_clip must be positive or None'
+            raise ValueError(msg)
+        self.residual_outlier_clip = residual_outlier_clip
+
+        residual_min_valid_samples = int(residual_min_valid_samples)
+        if residual_min_valid_samples <= 0:
+            msg = 'residual_min_valid_samples must be a positive integer'
+            raise ValueError(msg)
+        self.residual_min_valid_samples = residual_min_valid_samples
+
+        self.interpolate_missing_pixels = bool(interpolate_missing_pixels)
+        self.pixel_interpolation_method = pixel_interpolation_method
+        if self.pixel_interpolation_method not in ('cubic', 'nearest'):
+            msg = "pixel_interpolation_method must be 'cubic' or 'nearest'"
+            raise ValueError(msg)
+
+        self.residual_despike = bool(residual_despike)
 
     def __call__(self, stars):
         return self.build_epsf(stars)
@@ -493,7 +608,6 @@ class EPSFBuilder:
         epsf : `_LegacyEPSFModel`
             The initial ePSF model.
         """
-        norm_radius = self._norm_radius
         oversampling = self.oversampling
         shape = self.shape
 
@@ -547,41 +661,17 @@ class EPSFBuilder:
         # from the normalized star at the location of the star in the
         # undersampled grid.
 
-        x = star._xidx_centered
-        y = star._yidx_centered
+        # Compute the residual image for the star.
+        residual_img = star.compute_residual_image(epsf)
 
-        star_vals = star._data_values_normalized
-        epsf_vals = epsf.evaluate(x=x, y=y, flux=1.0, x_0=0.0, y_0=0.0)
+        # Normalise the residuals by the star flux
+        residual_img /= star.flux
 
-        if self.mask_background_pixels:
+        # Keep only unmasked residual samples so values match the
+        # unmasked coordinate vectors (star._xidx_centered/_yidx_centered).
+        residual_img = residual_img[~star.mask].ravel()
 
-            # Obtain the mean, median and standard deviation of the star cutout
-            mean, median, std = sigma_clipped_stats(star.data, sigma=3.0, maxiters=5)
-
-            # Get the threshold value for the star pixels
-            pix_threshold = median + 2.0 * std
-
-            # Mask the data which is below the threshold value
-            processed_image = np.where(star.data < pix_threshold, 0, star.data)
-
-            # Label the pixels above the threshold
-            labeled_array, num_features = label(processed_image > 0, structure=None)
-
-            # Get the label of the pixel with the maximum value
-            my_label = labeled_array[star.data == np.nanmax(star.data)][0]
-
-            # Make a mask of the pixels with the maximum label
-            star_mask = np.where(labeled_array == my_label, False, True).flatten()
-
-            # Mask the star pixels (make them nans) which are not part of the main source
-
-            star_vals_masked = np.where(star_mask, 0, star_vals)
-            stardata = (star_vals_masked - epsf_vals)
-
-        else:
-            stardata = (star_vals - epsf_vals)
-
-        # Convert pixel sample positions to the oversampled grid
+        # Convert pixel sample positions to the oversampled grid (1D arrays)
         x = epsf.oversampling[1] * star._xidx_centered
         y = epsf.oversampling[0] * star._yidx_centered
 
@@ -593,19 +683,21 @@ class EPSFBuilder:
         xidx = py2intround(x + epsf_xcenter)
         yidx = py2intround(y + epsf_ycenter)
 
-        # Calculate the distance between the pixel sample position and the index it belongs to in the oversampled grid. Normalise by the maximum distance a pixel can be from the index it belongs to.
-        xdist = np.abs(x + epsf_xcenter - xidx) / 0.5
-        ydist = np.abs(y + epsf_ycenter - yidx) / 0.5
-
         # Calculate the coordinates of the pixel relative to the index it belongs to in the oversampled grid
         x_coord = x + epsf_xcenter - xidx
         y_coord = y + epsf_ycenter - yidx
 
+        # Calculate the distance between the pixel sample position and the index it belongs to in the oversampled grid. Normalise by the maximum distance a pixel can be from the index it belongs to.
+        xdist = np.abs(x_coord) / 0.5
+        ydist = np.abs(y_coord) / 0.5
+
+        # Set up empty results arrays (2D arrays with the same shape as the ePSF data array)
         resampled_img = np.full(epsf.data.shape, np.nan)
         img_weights = np.full(epsf.data.shape, 0.0)
         x_coords_img = np.full(epsf.data.shape, np.nan)
         y_coords_img = np.full(epsf.data.shape, np.nan)
 
+        # Mask out any pixel samples that fall outside the bounds of the ePSF data array
         mask = np.logical_and(
             np.logical_and(xidx >= 0, xidx < epsf.data.shape[1]),
             np.logical_and(yidx >= 0, yidx < epsf.data.shape[0]))
@@ -617,7 +709,7 @@ class EPSFBuilder:
         y_coord_ = y_coord[mask]
 
         # Fill the resampled image with the (masked) residuals
-        resampled_img[yidx_, xidx_] = stardata[mask]
+        resampled_img[yidx_, xidx_] = residual_img[mask]
 
         # Compute the weights for the resampling
         img_weights[yidx_, xidx_] = 1.0 - 1/np.sqrt(2) * np.sqrt(xdist_**2 + ydist_**2)
@@ -719,8 +811,7 @@ class EPSFBuilder:
 
         return convolve(epsf_data, kernel)
 
-    def _recenter_epsf(self, epsf, centroid_func=centroid_com,
-                       box_size=(5, 5), maxiters=20, center_accuracy=1.0e-4):
+    def _recenter_epsf(self, epsf, center_accuracy=1.0e-4):
         """
         Calculate the center of the ePSF data and shift the data so the
         ePSF center is at the center of the ePSF data array.
@@ -729,25 +820,6 @@ class EPSFBuilder:
         ----------
         epsf : `_LegacyEPSFModel` object
             The ePSF model.
-
-        centroid_func : callable, optional
-            A callable object (e.g., function or class) that is used
-            to calculate the centroid of a 2D array. The callable must
-            accept a 2D `~numpy.ndarray`, have a ``mask`` keyword
-            and optionally an ``error`` keyword. The callable object
-            must return a tuple of two 1D `~numpy.ndarray` variables,
-            representing the x and y centroids.
-
-        box_size : float or tuple of two floats, optional
-            The size (in pixels) of the box used to calculate the
-            centroid of the ePSF during each build iteration. If a
-            single integer number is provided, then a square box will
-            be used. If two values are provided, then they must be in
-            ``(ny, nx)`` order. ``box_size`` must have odd values and be
-            greater than or equal to 3 for both axes.
-
-        maxiters : int, optional
-            The maximum number of recentering iterations to perform.
 
         center_accuracy : float, optional
             The desired accuracy for the centers of stars. The building
@@ -764,6 +836,12 @@ class EPSFBuilder:
         epsf = self.epsf_class(data=epsf.data,
                                 oversampling=epsf.oversampling,
                                 origin=epsf.origin)
+        maxiters = 10
+        box_size = np.rint((np.asarray(epsf.data.shape, dtype=float) - 1.0)
+                           / np.asarray(epsf.oversampling,
+                                        dtype=float)).astype(int)
+        box_size = np.maximum(box_size, 3)
+        box_size = np.where(box_size % 2 == 0, box_size + 1, box_size)
 
         xcenter, ycenter = epsf.origin
 
@@ -788,8 +866,8 @@ class EPSFBuilder:
             mask = ~np.isfinite(epsf_cutout)
 
             # find a new center position
-            xcenter_new, ycenter_new = centroid_func(epsf_cutout,
-                                                     mask=mask)
+            xcenter_new, ycenter_new = centroid_com(epsf_cutout,
+                                                    mask=mask)
 
             xcenter_new += slices_large[1].start
             ycenter_new += slices_large[0].start
@@ -819,7 +897,7 @@ class EPSFBuilder:
 
         return epsf_data
     
-    def _normalise_epsf(self, epsf, box_size=None):
+    def _normalise_epsf(self, epsf):
         """
         Normalize the ePSF data.
 
@@ -828,27 +906,18 @@ class EPSFBuilder:
         epsf: ImagePSF object
             The ePSF model.
 
-        box_size : float or tuple of two floats, optional
-            The size (in pixels) of the box used to normalize the
-            ePSF. If a single integer number is provided, then a square
-            box will be used. If two values are provided, then they
-            must be in ``(ny, nx)`` order. If `None`, then a box size
-            equal to the shape of the ePSF data will be used.
-
         Returns
         -------
         result : 2D `~numpy.ndarray`
             The normalized ePSF data.
         """
 
-        # Get the box size for normalizing the ePSF
-        if box_size is None:
-            box_size = epsf.data.shape / self.oversampling
-        else:
-            # Convert box size to integer
-            box_size = np.asarray(box_size, dtype=int)
-            box_size = as_pair('box_size', box_size,
-                               lower_bound=(3, 3), check_odd=False)
+        # Convert box size to integer
+        box_size = np.rint((np.asarray(epsf.data.shape, dtype=float) - 1.0)
+                           / np.asarray(self.oversampling,
+                                        dtype=float)).astype(int)
+        box_size = as_pair('box_size', box_size,
+                            lower_bound=(3, 3), check_odd=False)
             
         # Check that box size is >= 3
         if box_size[0] < 3 or box_size[1] < 3:
@@ -871,11 +940,317 @@ class EPSFBuilder:
         if total > 0.0:
             epsf_data = epsf.data / total
         else:
+            # Warning: if the total is zero or negative, we cannot normalize, so we return the original data and issue a warning.
+            warnings.warn('Cannot normalize ePSF because total is non-positive. Returning original ePSF data.', AstropyUserWarning)
             epsf_data = epsf.data
 
         return epsf_data
 
-    def _build_epsf_step(self, stars, epsf=None):
+    @staticmethod
+    def _mad_std(values):
+        """
+        Return a robust standard-deviation estimate from the MAD.
+        """
+        values = np.asanyarray(values, dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return np.nan
+        median = np.nanmedian(values)
+        mad = np.nanmedian(np.abs(values - median))
+        return 1.4826 * mad
+
+    def _select_residual_stars(self, stars, epsf):
+        """
+        Select stars for the residual stack using a robust RMS clip.
+        """
+        good_stars = stars.all_good_stars
+        if len(good_stars) == 0 or self.residual_star_rms_clip is None:
+            return good_stars
+
+        rms_values = []
+        for star in good_stars:
+            flux = float(np.asanyarray(star.flux, dtype=float))
+            if not np.isfinite(flux) or flux == 0.0:
+                rms_values.append(np.nan)
+                continue
+
+            residual = star.compute_residual_image(epsf) / flux
+            residual = residual[~star.mask]
+            residual = residual[np.isfinite(residual)]
+            if residual.size == 0:
+                rms_values.append(np.nan)
+            else:
+                rms_values.append(np.sqrt(np.nanmean(residual**2)))
+
+        rms_values = np.asarray(rms_values, dtype=float)
+        valid = np.isfinite(rms_values)
+        if np.count_nonzero(valid) < 3:
+            return good_stars
+
+        center = np.nanmedian(rms_values[valid])
+        scale = self._mad_std(rms_values[valid])
+        if not np.isfinite(scale) or scale == 0.0:
+            return good_stars
+
+        threshold = center + self.residual_star_rms_clip * scale
+        selected = [star for star, rms in zip(good_stars, rms_values,
+                                              strict=True)
+                    if np.isfinite(rms) and rms <= threshold]
+
+        return selected if len(selected) > 0 else good_stars
+
+    def _combine_residual_stack(self, residuals, weights, x_coords, y_coords):
+        """
+        Combine a residual stack into a single robust 2D residual image.
+        """
+        _, ny, nx = residuals.shape
+        combined = np.full((ny, nx), np.nan)
+        counts = np.zeros((ny, nx), dtype=int)
+
+        for i in range(ny):
+            for j in range(nx):
+                z = residuals[:, i, j]
+                valid = np.isfinite(z)
+                valid_count = np.count_nonzero(valid)
+                counts[i, j] = valid_count
+                if valid_count < self.residual_min_valid_samples:
+                    continue
+
+                z = z[valid]
+                w = weights[valid, i, j]
+                x = x_coords[valid, i, j]
+                y = y_coords[valid, i, j]
+
+                if self.residual_outlier_clip is not None and z.size >= 3:
+                    center = np.nanmedian(z)
+                    scale = self._mad_std(z)
+                    if np.isfinite(scale) and scale > 0.0:
+                        keep = np.abs(z - center) <= (self.residual_outlier_clip
+                                                      * scale)
+                        if np.count_nonzero(keep) >= self.residual_min_valid_samples:
+                            z = z[keep]
+                            w = w[keep]
+                            x = x[keep]
+                            y = y[keep]
+
+                if z.size < self.residual_min_valid_samples:
+                    continue
+
+                if self.gridpoint_estimation == 'mean':
+                    combined[i, j] = np.nanmean(z)
+                elif self.gridpoint_estimation == 'median':
+                    combined[i, j] = np.nanmedian(z)
+                elif self.gridpoint_estimation == 'weighted_mean':
+                    valid_w = np.isfinite(w) & (w > 0.0)
+                    if np.count_nonzero(valid_w) < self.residual_min_valid_samples:
+                        continue
+                    denom = np.nansum(w[valid_w])
+                    if denom > 0.0:
+                        combined[i, j] = np.nansum(z[valid_w] * w[valid_w]) / denom
+                elif self.gridpoint_estimation == 'polyfit':
+                    if z.size <= 10:
+                        combined[i, j] = np.nanmedian(z)
+                    else:
+                        A = np.column_stack((np.ones_like(x), x, y,
+                                             x**2, x * y, y**2))
+                        coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+                        combined[i, j] = coeffs[0]
+                else:
+                    msg = 'Unsupported gridpoint_estimation method'
+                    raise TypeError(msg)
+
+        return combined, counts
+
+    def _interpolate_missing_residual_pixels(self, residuals):
+        """
+        Fill missing residual pixels in the oversampled ePSF grid.
+        """
+        residuals = np.array(residuals, copy=True, dtype=float)
+        mask = ~np.isfinite(residuals)
+        if not np.any(mask):
+            return residuals
+
+        if not self.interpolate_missing_pixels:
+            residuals[mask] = 0.0
+            return residuals
+
+        if np.all(mask):
+            residuals[:] = 0.0
+            return residuals
+
+        method = self.pixel_interpolation_method
+        if method == 'cubic' and np.count_nonzero(~mask) < 3:
+            method = 'nearest'
+
+        try:
+            residuals = _interpolate_missing_data(residuals, mask=mask,
+                                                  method=method)
+        except (ValueError, RuntimeError, QhullError):
+            residuals = _interpolate_missing_data(residuals, mask=mask,
+                                                  method='nearest')
+
+        remaining = ~np.isfinite(residuals)
+        if np.any(remaining):
+            residuals = _interpolate_missing_data(residuals, mask=remaining,
+                                                  method='nearest')
+
+        residuals[~np.isfinite(residuals)] = 0.0
+        return residuals
+
+    def _despike_residuals(self, residuals):
+        """
+        Replace isolated hot residual cells with the local median.
+        """
+        if not self.residual_despike:
+            return residuals
+
+        residual_despike_boxsize = (3, 3)
+        residual_despike_passes = 2
+        residual_despike_threshold = 3.0
+
+        footprint = np.ones(residual_despike_boxsize, dtype=bool)
+        center = tuple(size // 2 for size in residual_despike_boxsize)
+        footprint[center] = False
+
+        despiked = residuals.copy()
+        hot_mask = np.zeros_like(residuals, dtype=bool)
+
+        for _ in range(residual_despike_passes):
+            local_median = median_filter(despiked, footprint=footprint,
+                                         mode='nearest')
+
+            local_abs_dev = median_filter(np.abs(despiked - local_median),
+                                          footprint=footprint,
+                                          mode='nearest')
+            local_scale = 1.4826 * local_abs_dev
+
+            hot_mask = np.abs(despiked - local_median) > (
+                residual_despike_threshold * local_scale)
+            hot_mask &= np.isfinite(despiked)
+            hot_mask &= np.isfinite(local_median)
+
+            if not np.any(hot_mask):
+                break
+
+            despiked[hot_mask] = local_median[hot_mask]
+
+        # TEMP: Plot the hot mask for diagnostics
+        if self.plot_diagnostics:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(6, 6))
+            ax.imshow(hot_mask, origin='lower', cmap='Reds')
+            ax.set_title('Hot Residual Mask')
+            ax.set_xlabel('X Pixel Index')
+            ax.set_ylabel('Y Pixel Index')
+            fig.colorbar(ax.images[0], ax=ax, label='Hot Mask Value')
+            if not plt.isinteractive():
+                plt.close(fig)
+
+        return despiked
+
+    def _plot_residual_quadrant_stacks(self, stack_stars, residuals, weights,
+                                       x_coords, y_coords):
+        """
+        Plot combined residual stacks split by detector-position quadrant.
+        """
+        if not self.plot_diagnostics or len(stack_stars) == 0:
+            return
+
+        centers = np.asarray([star.center for star in stack_stars], dtype=float)
+        if centers.ndim != 2 or centers.shape[1] != 2:
+            return
+
+        xmin, ymin = np.min(centers, axis=0)
+        xmax, ymax = np.max(centers, axis=0)
+        xmid = 0.5 * (xmin + xmax)
+        ymid = 0.5 * (ymin + ymax)
+
+        quadrant_masks = (
+            ((centers[:, 0] <= xmid) & (centers[:, 1] <= ymid), 'Lower Left'),
+            ((centers[:, 0] > xmid) & (centers[:, 1] <= ymid), 'Lower Right'),
+            ((centers[:, 0] <= xmid) & (centers[:, 1] > ymid), 'Upper Left'),
+            ((centers[:, 0] > xmid) & (centers[:, 1] > ymid), 'Upper Right'),
+        )
+
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10),
+                                 constrained_layout=True)
+        axes = axes.ravel()
+
+        for ax, (mask, title) in zip(axes, quadrant_masks, strict=True):
+            if not np.any(mask):
+                combined = np.full(residuals.shape[1:], np.nan)
+            else:
+                combined, _ = self._combine_residual_stack(
+                    residuals[mask], weights[mask], x_coords[mask], y_coords[mask])
+
+            im = ax.imshow(combined, origin='lower', cmap='coolwarm')
+            ax.set_title(f'{title} ({np.count_nonzero(mask)} stars)')
+            ax.set_xlabel('X Pixel Index')
+            ax.set_ylabel('Y Pixel Index')
+            fig.colorbar(im, ax=ax, label='Residual Value')
+
+        fig.suptitle('Combined Residual Stacks by Image Region')
+        if not plt.isinteractive():
+            plt.close(fig)
+
+    def _plot_residual_flux_stacks(self, stack_stars, residuals, weights,
+                                   x_coords, y_coords):
+        """
+        Plot combined residual stacks split by stellar flux.
+        """
+        if not self.plot_diagnostics or len(stack_stars) == 0:
+            return
+
+        fluxes = np.asarray([star.flux for star in stack_stars], dtype=float)
+        valid = np.isfinite(fluxes)
+        if np.count_nonzero(valid) == 0:
+            return
+
+        fluxes_valid = fluxes[valid]
+        fmin = np.min(fluxes_valid)
+        fmax = np.max(fluxes_valid)
+        if fmin == fmax:
+            bin_masks = (
+                (valid, 'All Fluxes'),
+                (np.zeros_like(valid, dtype=bool), 'Mid Flux'),
+                (np.zeros_like(valid, dtype=bool), 'High Flux'),
+            )
+        else:
+            edges = np.linspace(fmin, fmax, 4)
+            bin_masks = (
+                (valid & (fluxes >= edges[0]) & (fluxes <= edges[1]),
+                 f'Low Flux [{edges[0]:.3g}, {edges[1]:.3g}]'),
+                (valid & (fluxes > edges[1]) & (fluxes <= edges[2]),
+                 f'Mid Flux ({edges[1]:.3g}, {edges[2]:.3g}]'),
+                (valid & (fluxes > edges[2]) & (fluxes <= edges[3]),
+                 f'High Flux ({edges[2]:.3g}, {edges[3]:.3g}]'),
+            )
+
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5),
+                                 constrained_layout=True)
+
+        for ax, (mask, title) in zip(axes, bin_masks, strict=True):
+            if not np.any(mask):
+                combined = np.full(residuals.shape[1:], np.nan)
+            else:
+                combined, _ = self._combine_residual_stack(
+                    residuals[mask], weights[mask], x_coords[mask], y_coords[mask])
+
+            im = ax.imshow(combined, origin='lower', cmap='coolwarm')
+            ax.set_title(f'{title}\n({np.count_nonzero(mask)} stars)')
+            ax.set_xlabel('X Pixel Index')
+            ax.set_ylabel('Y Pixel Index')
+            fig.colorbar(im, ax=ax, label='Residual Value')
+
+        fig.suptitle('Combined Residual Stacks by Flux Bin')
+        if not plt.isinteractive():
+            plt.close(fig)
+
+    def _build_epsf_step(self, stars, epsf=None, *, iter_num=None):
         """
         A single iteration of improving an ePSF.
 
@@ -905,93 +1280,35 @@ class EPSFBuilder:
             # improve the input ePSF
             epsf = copy.deepcopy(epsf)
 
+        stack_stars = self._select_residual_stars(stars, epsf)
+        if len(stack_stars) == 0:
+            stack_stars = stars.all_good_stars
+
         # compute a 3D stack of 2D residual images
-        residuals, weights, x_coords, y_coords = self._resample_residuals(stars, epsf)
+        residuals, weights, x_coords, y_coords = self._resample_residuals(
+            EPSFStars(stack_stars), epsf)
+        
+        # TODO: Plot diagnostic plot for the residuals
 
-        # compute the sigma-clipped average along the 3D stack
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', category=RuntimeWarning)
-            warnings.simplefilter('ignore', category=AstropyUserWarning)
+        residuals, residual_counts = self._combine_residual_stack(
+            residuals, weights, x_coords, y_coords)
+        residuals = self._interpolate_missing_residual_pixels(residuals)
+        
+        if self.plot_diagnostics:
+            self._plot_residual_image(residuals)
 
-            if self.gridpoint_estimation == 'mean':
-                residuals = self._sigma_clip(residuals, axis=0, masked=False,
-                                            return_bounds=False)
-                residuals = np.nanmean(residuals, axis=0)
-
-            elif self.gridpoint_estimation == 'median':
-                residuals = self._sigma_clip(residuals, axis=0, masked=False,
-                                            return_bounds=False)
-                residuals = nanmedian(residuals, axis=0)
-
-            elif self.gridpoint_estimation == 'weighted_mean':
-                # Create a masked array to perform sigma clipping
-                residuals = self._sigma_clip(residuals, axis=0, masked=True,
-                             return_bounds=False)
-                # Fill masked values with np.nan
-                residuals = residuals.filled(np.nan)
-                # Created masked weights array with same mask as residuals
-                weights = np.ma.masked_array(weights, mask=np.isnan(residuals))
-                # Fill masked weight values with np.nan
-                weights = weights.filled(np.nan)
-                # Iterate over the residuals and weights to calculate the weighted average
-                residuals = np.nansum(residuals * weights, axis=0) / np.nansum(weights, axis=0)
-
-            elif self.gridpoint_estimation == 'polyfit':
-                # Fit a 2D quadratic polynomialsurface to the residuals for
-                # each gridsection.
-                # Assume residuals, x_coords, y_coords are already defined
-                N, My, Mx = residuals.shape  # Shape of the input 3D matrices
-                fitted_matrix = np.full((My, Mx), np.nan)  # Initialize with NaNs
-
-                for i in range(My):
-                    for j in range(Mx):
-                        # Extract valid samples across N slices
-                        valid_mask = ~np.isnan(residuals[:, i, j])
-                        x_samples = x_coords[valid_mask, i, j]
-                        y_samples = y_coords[valid_mask, i, j]
-                        z_samples = residuals[valid_mask, i, j]
-                        
-                        num_samples = len(z_samples)
-                        if num_samples == 1:
-                            fitted_matrix[i, j] = z_samples[0]  # Use single value directly
-                        elif num_samples > 1 and num_samples <= 5:
-                            A = np.column_stack( (
-                                np.ones_like(x_samples), x_samples, y_samples
-                            ))
-                            coeffs, _, _, _ = np.linalg.lstsq(A, z_samples, rcond=None)
-                            fitted_matrix[i, j] = coeffs[0]  # Evaluate at (0,0)
-                        elif num_samples > 5:
-                            A = np.column_stack( (
-                                np.ones_like(x_samples), x_samples, y_samples, x_samples**2, x_samples*y_samples, y_samples**2
-                            ))
-                            coeffs, _, _, _ = np.linalg.lstsq(A, z_samples, rcond=None)
-                            fitted_matrix[i, j] = coeffs[0]  # Evaluate at (0,0)
-
-                residuals = fitted_matrix
-
-            else:
-                msg = 'Unsupported gridpoint_estimation method'
-                raise TypeError(msg)
-
-        # interpolate any missing data (np.nan)
-        mask = ~np.isfinite(residuals)
-        if np.any(mask):
-            residuals = _interpolate_missing_data(residuals, mask,
-                                                  method='cubic')
-
-            # fill any remaining nans (outer points) with zeros
-            residuals[~np.isfinite(residuals)] = 0.0
+        if iter_num is None or iter_num >= 2:
+            residuals = self._despike_residuals(residuals)
 
         if self.residual_smoothing is not None:
             # Smooth the residuals
             residuals = convolve(residuals, self.residual_smoothing)
 
-        # add the residuals to the previous ePSF image
-        new_epsf_data = epsf.data + residuals
+        if self.plot_diagnostics:
+            self._plot_residual_image(residuals)
 
-        if self.epsf_nonnegative:
-            # Constrain the ePSF model to be non-negative
-            new_epsf_data = np.clip(new_epsf_data, 0.0, None)
+        # add the residuals to the previous ePSF image
+        new_epsf_data = epsf.data + (0.8 * residuals)
 
         # smooth and recenter the ePSF
         smoothed_data = self._smooth_epsf(new_epsf_data)
@@ -1000,31 +1317,496 @@ class EPSFBuilder:
                                 oversampling=epsf.oversampling,
                                 origin=epsf.origin)
 
-        recentered_data = self._recenter_epsf(
-            epsf, centroid_func=self.recentering_func,
-            box_size=self.recentering_boxsize,
-            maxiters=self.recentering_maxiters)
-        
-        # Make sure there are no negative values after recentering
-        if self.epsf_nonnegative:
-            recentered_data = np.clip(recentered_data, 0.0, None)
+        if self.recenter_epsf:
+            recentered_data = self._recenter_epsf(epsf)
+        else:
+            recentered_data = smoothed_data
 
         epsf = self.epsf_class(data=recentered_data,
                                 oversampling=epsf.oversampling,
                                 origin=epsf.origin)
         
+        # Normalize the ePSF
         if self.normalise_epsf:
-            normalised_data = self._normalise_epsf(epsf, box_size=self._norm_radius)
+            normalised_data = self._normalise_epsf(epsf)
         else:
             normalised_data = recentered_data
 
-        return_epsf = self.epsf_class(data=recentered_data,
+        # Clip the edges of the ePSF data if required
+        if self.edge_clip and self.edge_clip > 0:
+            clipped_data = normalised_data.copy()
+            clipped_data[:self.edge_clip, :] = 0.0
+            clipped_data[-self.edge_clip:, :] = 0.0
+            clipped_data[:, :self.edge_clip] = 0.0
+            clipped_data[:, -self.edge_clip:] = 0.0
+        else:
+            clipped_data = normalised_data
+
+        return_epsf = self.epsf_class(data=clipped_data,
                                 oversampling=epsf.oversampling,
                                 origin=epsf.origin)
+        
+        if self.plot_diagnostics:
+            self._plot_epsf(return_epsf)
 
         return return_epsf
+    
+    def _resample_epsf(self, epsf, oversampling):
+        """
+        Resample the input ePSF to the oversampling factor used in the build process.
 
-    def build_epsf(self, stars, *, init_epsf=None):
+        Parameters
+        ----------
+        epsf : `ImagePSF` object
+            The input ePSF model.
+
+        oversampling : tuple of two ints
+            The oversampling factor used in the build process.
+
+        Returns
+        -------
+        resampled_epsf_data : 2D `~numpy.ndarray`
+            A 2D array containing the resampled ePSF data.
+        """
+
+        # Convert from oversampled-array dimensions to the equivalent
+        # image-grid dimensions using grid endpoints, then convert to
+        # the requested oversampling.
+        input_shape = ((np.asarray(epsf.data.shape, dtype=float) - 1.0)
+                       / np.asarray(epsf.oversampling, dtype=float))
+        output_shape = np.rint(input_shape * np.asarray(oversampling)
+                               + 1.0).astype(int)
+
+        # Ensure odd output dimensions so the central pixel is well defined.
+        output_shape = np.where(output_shape % 2 == 0, output_shape + 1,
+                                output_shape)
+
+        output_center_yx = (output_shape - 1.0) / 2.0
+
+        # Evaluate on the requested image-coordinate grid.
+        y = (np.arange(output_shape[0], dtype=float) - output_center_yx[0])
+        y /= oversampling[0]
+        x = (np.arange(output_shape[1], dtype=float) - output_center_yx[1])
+        x /= oversampling[1]
+        yy, xx = np.meshgrid(y, x, indexing='ij')
+
+        # Evaluate the input ePSF at these x and y values to get the resampled ePSF data
+        resampled_epsf_data = epsf.evaluate(x=xx, y=yy, flux=1.0, x_0=0.0, y_0=0.0)
+
+        return resampled_epsf_data
+    
+    def _collect_ppe_residual_results(self, stars):
+        """
+        Collect PPE residual samples from linked stars.
+        """
+        residual_results = {'subpixel_x': [], 'subpixel_y': [],
+                            'x_residual': [], 'y_residual': [],
+                            'flux_residual': [], 'center_x': [],
+                            'center_y': []}
+
+        # Iterate over the linked stars in stars
+        for linked_star in stars._data:
+            if not isinstance(linked_star, LinkedEPSFStar):
+                continue
+            # Check that linked star has at least 3 good stars to ensure a reliable mean position and flux.
+            if len(linked_star.all_good_stars) < 3:
+                continue
+            mean_flux = linked_star.get_mean_flux()
+            mean_ra, mean_dec = linked_star.get_mean_radec()
+            if mean_flux is None or not np.isfinite(mean_flux):
+                continue
+
+            # Iterate over each star in the linked star.
+            for star in linked_star.all_good_stars:
+                if star.wcs_large is None:
+                    continue
+
+                # Calculate the linked-star mean sky position projected
+                # onto this detector frame.
+                mean_x, mean_y = star.wcs_large.world_to_pixel_values(
+                    mean_ra, mean_dec)
+                if not (np.isfinite(mean_x) and np.isfinite(mean_y)):
+                    continue
+
+                # Calculate the measured-minus-mean residuals.
+                x_residual = star.center[0] - mean_x
+                y_residual = star.center[1] - mean_y
+
+                if mean_flux == 0.0:
+                    flux_residual = 0.0
+                else:
+                    flux_residual = (star.flux - mean_flux) / mean_flux
+
+                # Record the residuals with the measured (uncorrected)
+                # subpixel position of the star.
+                residual_results['subpixel_x'].append(np.mod(star.center[0],
+                                                             1.0))
+                residual_results['subpixel_y'].append(np.mod(star.center[1],
+                                                             1.0))
+                residual_results['x_residual'].append(x_residual)
+                residual_results['y_residual'].append(y_residual)
+                residual_results['flux_residual'].append(flux_residual)
+                residual_results['center_x'].append(star.center[0])
+                residual_results['center_y'].append(star.center[1])
+
+        return residual_results
+
+    def _generate_ppe_map_from_results(self, residual_results,
+                                       supersampling=None):
+        """
+        Generate a PPE map from precomputed residual samples.
+        """
+        if supersampling is None:
+            supersampling = self.oversampling
+        supersampling = as_pair('supersampling', supersampling,
+                                lower_bound=(1, 1))
+
+        # Set up results arrays for the PPE maps
+        ppe_flux_map = np.full((supersampling[0], supersampling[1]), np.nan)
+        ppe_x_map = np.full((supersampling[0], supersampling[1]), np.nan)
+        ppe_y_map = np.full((supersampling[0], supersampling[1]), np.nan)
+
+        if len(residual_results['subpixel_x']) == 0:
+            return PPEMap(supersampling, np.zeros_like(ppe_flux_map),
+                          np.zeros_like(ppe_x_map),
+                          np.zeros_like(ppe_y_map))
+
+        subpixel_x = np.asarray(residual_results['subpixel_x'])
+        subpixel_y = np.asarray(residual_results['subpixel_y'])
+        flux_residual = np.asarray(residual_results['flux_residual'])
+        x_residual = np.asarray(residual_results['x_residual'])
+        y_residual = np.asarray(residual_results['y_residual'])
+
+        xbin = np.floor(subpixel_x * supersampling[1]).astype(int)
+        ybin = np.floor(subpixel_y * supersampling[0]).astype(int)
+        xbin = np.clip(xbin, 0, supersampling[1] - 1)
+        ybin = np.clip(ybin, 0, supersampling[0] - 1)
+
+        # Generate the PPE map arrays from the residual results using
+        # the median value in each supersampled subpixel bin.
+        for j in range(supersampling[0]):
+            for i in range(supersampling[1]):
+                mask = (xbin == i) & (ybin == j)
+                if not np.any(mask):
+                    continue
+                ppe_flux_map[j, i] = np.nanmedian(flux_residual[mask])
+                ppe_x_map[j, i] = np.nanmedian(x_residual[mask])
+                ppe_y_map[j, i] = np.nanmedian(y_residual[mask])
+
+        for ppe_map, fill_value in ((ppe_flux_map, 0.0), (ppe_x_map, 0.0),
+                                    (ppe_y_map, 0.0)):
+            mask = ~np.isfinite(ppe_map)
+            if not np.any(mask):
+                continue
+            if np.all(mask):
+                ppe_map[:] = fill_value
+                continue
+            ppe_map[:] = _interpolate_missing_data(ppe_map, mask=mask,
+                                                   method='nearest')
+            ppe_map[~np.isfinite(ppe_map)] = fill_value
+
+        # Generate a PPEMap object from the PPE map arrays.
+        return PPEMap(supersampling, ppe_flux_map, ppe_x_map, ppe_y_map)
+
+    def _generate_ppe_map(self, stars, supersampling=None):
+        """
+        Generate supersampled 2D PPE maps for the flux and position
+        measurements of the stars.
+        """
+        residual_results = self._collect_ppe_residual_results(stars)
+        return self._generate_ppe_map_from_results(residual_results,
+                                                   supersampling=supersampling)
+
+    def _plot_ppe_region_diagnostics(self, stars, supersampling=None):
+        """
+        Plot PPE maps split by detector-position quadrant.
+        """
+        if not self.plot_diagnostics:
+            return None
+
+        residual_results = self._collect_ppe_residual_results(stars)
+        if len(residual_results['subpixel_x']) == 0:
+            return None
+
+        center_x = np.asarray(residual_results['center_x'], dtype=float)
+        center_y = np.asarray(residual_results['center_y'], dtype=float)
+        xmin = np.min(center_x)
+        xmax = np.max(center_x)
+        ymin = np.min(center_y)
+        ymax = np.max(center_y)
+        xmid = 0.5 * (xmin + xmax)
+        ymid = 0.5 * (ymin + ymax)
+
+        quadrant_masks = (
+            ((center_x <= xmid) & (center_y <= ymid), 'Lower Left'),
+            ((center_x > xmid) & (center_y <= ymid), 'Lower Right'),
+            ((center_x <= xmid) & (center_y > ymid), 'Upper Left'),
+            ((center_x > xmid) & (center_y > ymid), 'Upper Right'),
+        )
+
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(4, 3, figsize=(12, 14),
+                                 constrained_layout=True)
+        sample_factor = 3
+        map_specs = (
+            ('flux_ppe', 'Flux PPE', 'Fractional flux residual'),
+            ('x_ppe', 'X PPE', 'X residual (pixels)'),
+            ('y_ppe', 'Y PPE', 'Y residual (pixels)'),
+        )
+        extent = (0.0, 1.0, 0.0, 1.0)
+
+        for row, (mask, region_title) in enumerate(quadrant_masks):
+            region_results = {}
+            for key, values in residual_results.items():
+                arr = np.asarray(values)
+                region_results[key] = arr[mask]
+
+            region_map = self._generate_ppe_map_from_results(
+                region_results, supersampling=supersampling)
+
+            yphase = np.linspace(0.0, 1.0,
+                                 region_map.supersampling[0] * sample_factor,
+                                 endpoint=False)
+            xphase = np.linspace(0.0, 1.0,
+                                 region_map.supersampling[1] * sample_factor,
+                                 endpoint=False)
+            xx, yy = np.meshgrid(xphase, yphase)
+
+            sampled_maps = (
+                region_map._sample_periodic_map(region_map.flux_ppe, xx, yy,
+                                                region_map.supersampling),
+                region_map._sample_periodic_map(region_map.x_ppe, xx, yy,
+                                                region_map.supersampling),
+                region_map._sample_periodic_map(region_map.y_ppe, xx, yy,
+                                                region_map.supersampling),
+            )
+
+            for col, ((_, title, cbar_label), data) in enumerate(
+                    zip(map_specs, sampled_maps, strict=True)):
+                ax = axes[row, col]
+                im = ax.imshow(data, origin='lower', extent=extent,
+                               cmap='coolwarm', aspect='equal')
+                ax.set_title(f'{region_title}: {title}')
+                ax.set_xlabel('Subpixel x phase')
+                ax.set_ylabel('Subpixel y phase')
+                fig.colorbar(im, ax=ax, label=cbar_label)
+
+        if not plt.isinteractive():
+            plt.close(fig)
+        return fig
+
+    def _plot_diagnostics(self, stars, ppe_map):
+        """
+        Plot PPE diagnostics when enabled.
+        """
+        if not self.plot_diagnostics:
+            return None
+
+        fig = ppe_map.plot_maps()
+        region_fig = self._plot_ppe_region_diagnostics(stars)
+        if not plt.isinteractive():
+            plt.close(fig)
+            plt.close(region_fig)
+        return region_fig
+    
+    def _plot_star_distribution(self, stars):
+        """
+        Plot the distribution of the star sample in image coordinates and sub-pixel coordinates, and the coverage of the sub-pixel bins by the star sample.
+        """
+        if not self.plot_diagnostics:
+            return None
+
+        import matplotlib.pyplot as plt
+
+        # Plot 1: Star sample distributions
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        # Subfigure 1: Image positions of the stars color-coded by flux
+        centers = np.asarray([star.center for star in stars.all_good_stars], dtype=float)
+        fluxes = np.asarray([star.flux for star in stars.all_good_stars], dtype=float)
+        sc = axes[0].scatter(centers[:, 0], centers[:, 1], c=fluxes, s=10, alpha=0.7, cmap='viridis')
+        axes[0].set_title('Star Image Positions')
+        axes[0].set_xlabel('X Pixel Coordinate')
+        axes[0].set_ylabel('Y Pixel Coordinate')
+        axes[0].set_aspect('equal')
+        cbar = fig.colorbar(sc, ax=axes[0])
+        cbar.set_label('Flux (counts per second)')
+        # Subfigure 2: Sub-pixel positions of the stars
+        # Wrap to [-0.5, 0.5) so all points map into finite-width bins
+        # without requiring an extra empty edge bin.
+        subpixel_x = ((np.mod(centers[:, 0], 1.0) + 0.5) % 1.0) - 0.5
+        subpixel_y = ((np.mod(centers[:, 1], 1.0) + 0.5) % 1.0) - 0.5
+        axes[1].scatter(subpixel_x, subpixel_y, c=fluxes, s=10, alpha=0.7, cmap='viridis')
+        # Set the limits to show the full range of sub-pixel positions    
+        axes[1].set_xlim(-0.5, 0.5)
+        axes[1].set_ylim(-0.5, 0.5)
+
+        n_bins_x = int(self.oversampling[1])
+        n_bins_y = int(self.oversampling[0])
+        x_edges = np.linspace(-0.5, 0.5, n_bins_x + 1)
+        y_edges = np.linspace(-0.5, 0.5, n_bins_y + 1)
+
+        # Show subpixel-gridsection boundaries for better visualization
+        for b in x_edges[1:-1]:
+            axes[1].axvline(b, color='gray', linestyle='--', linewidth=0.5)
+        for b in y_edges[1:-1]:
+            axes[1].axhline(b, color='gray', linestyle='--', linewidth=0.5)
+        # Set the title and labels for the sub-pixel position plot
+        axes[1].set_title('Star Sub-Pixel Positions')
+        axes[1].set_xlabel('Sub-Pixel X Phase')
+        axes[1].set_ylabel('Sub-Pixel Y Phase')
+        axes[1].set_aspect('equal')
+        cbar = fig.colorbar(sc, ax=axes[1])
+        cbar.set_label('Flux (counts per second)')
+        # Subfigure 3: Count the number of stars in each sub-pixel bin
+        xbin = np.searchsorted(x_edges, subpixel_x, side='right') - 1
+        ybin = np.searchsorted(y_edges, subpixel_y, side='right') - 1
+        xbin = np.clip(xbin, 0, n_bins_x - 1)
+        ybin = np.clip(ybin, 0, n_bins_y - 1)
+
+        bin_counts = np.zeros((n_bins_y, n_bins_x), dtype=int)
+        np.add.at(bin_counts, (ybin, xbin), 1)
+
+        im = axes[2].imshow(bin_counts, origin='lower', cmap='plasma')
+        axes[2].set_title('Star Counts in Sub-Pixel Bins')
+        axes[2].set_xlabel('Sub-Pixel X Bin')
+        axes[2].set_ylabel('Sub-Pixel Y Bin')
+        cbar = fig.colorbar(im, ax=axes[2])
+        cbar.set_label('Number of Stars')
+        # Subfigure 4: Number of unique star id_labels in each sub-pixel bin (to check for linked-star coverage)
+        id_labels = np.asarray([star.id_label for star in stars.all_good_stars])
+        id_bin_counts = np.zeros((n_bins_y, n_bins_x), dtype=int)
+        id_sets = [[set() for _ in range(n_bins_x)] for _ in range(n_bins_y)]
+        for xb, yb, id_label in zip(xbin, ybin, id_labels, strict=True):
+            id_sets[yb][xb].add(id_label)
+        for j in range(n_bins_y):
+            for i in range(n_bins_x):
+                id_bin_counts[j, i] = len(id_sets[j][i])
+
+        im = axes[3].imshow(id_bin_counts, origin='lower', cmap='inferno')
+        axes[3].set_title('Unique Star ID Counts in Sub-Pixel Bins')
+        axes[3].set_xlabel('Sub-Pixel X Bin')
+        axes[3].set_ylabel('Sub-Pixel Y Bin')
+        cbar = fig.colorbar(im, ax=axes[3])
+        cbar.set_label('Number of Unique Star IDs')
+        if not plt.isinteractive():
+            plt.close(fig)
+        return fig
+
+    def _plot_residual_image(self, residuals):
+        """
+        Plot the combined residual image.
+        """
+        if not self.plot_diagnostics:
+            return None
+
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(residuals, origin='lower', cmap='coolwarm')
+        ax.set_title('Combined Residual Image')
+        ax.set_xlabel('X Pixel Index')
+        ax.set_ylabel('Y Pixel Index')
+        fig.colorbar(im, ax=ax, label='Residual Value')
+        if not plt.isinteractive():
+            plt.close(fig)
+
+    def _plot_epsf(self, epsf):
+        """
+        Plot the ePSF image.
+        """
+        if not self.plot_diagnostics:
+            return None
+
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(epsf.data, origin='lower', cmap='viridis')
+        ax.set_title('ePSF Image')
+        ax.set_xlabel('X Pixel Index')
+        ax.set_ylabel('Y Pixel Index')
+        fig.colorbar(im, ax=ax, label='ePSF Value')
+        if not plt.isinteractive():
+            plt.close(fig)
+
+    def _correct_stars_ppe(self, stars, ppe_map, *, apply_flux=True,
+                           apply_position=True, flux_damping=1.0):
+        """
+        Apply PPE corrections to the stars' fitted fluxes and centers.
+        """
+        corrected_stars = copy.deepcopy(stars)
+
+        for star in corrected_stars.all_stars:
+            corrected_flux, corrected_x, corrected_y = ppe_map(
+                star.flux, star.center[0], star.center[1])
+            if apply_flux:
+                star.flux = (star.flux
+                             + flux_damping * (corrected_flux - star.flux))
+            if apply_position:
+                star.cutout_center = np.array((corrected_x, corrected_y),
+                                              dtype=float) - star.origin
+
+        return corrected_stars
+
+    def _apply_ppe_corrections(self, stars, ppe_map, *, iteration=None,
+                               final=False):
+        """
+        Apply PPE corrections using the configured in-loop/final policy.
+        """
+        apply_position = 'Position' in self.calibrate_ppe
+        apply_flux = False
+        flux_damping = 0.8
+
+        if final:
+            apply_flux = 'Flux' in self.calibrate_ppe
+            flux_damping = 1.0
+        elif 'Flux' in self.calibrate_ppe and iteration is not None:
+            apply_flux = True
+
+        if not apply_position and not apply_flux:
+            return stars
+
+        return self._correct_stars_ppe(stars, ppe_map,
+                                       apply_flux=apply_flux,
+                                       apply_position=apply_position,
+                                       flux_damping=flux_damping)
+
+    def _apply_linked_star_constraints(self, stars, refit_flux=True):
+        """
+        Apply the configured linked-star constraints.
+
+        If refit_flux is true, then the fluxes of stars are re-fit with their constrained positions, then the fluxes are constrained.
+        """
+        if 'Position' in self.constrain_stars:
+            stars.constrain_linked_centres()
+
+        if refit_flux and self.current_epsf is not None:
+            epsf = self.current_epsf.deepcopy()
+            epsf.x_0.fixed = True
+            epsf.y_0.fixed = True
+            stars = self.fitter(epsf, stars)
+
+        if 'Flux' in self.constrain_stars:
+            stars.constrain_linked_fluxes()
+
+        return stars
+
+    def _get_init_epsf(self, epsf):
+        """
+        Obtain the initial ePSF model from the input ePSF model, noting that the input ePSF model may not have the same oversampling factor as the ePSF model used in the build process. The initial ePSF should be constructed by resampling the input ePSF to the oversampling factor and origin used in the build process."""
+        
+        if not isinstance(epsf, ImagePSF):
+            return None
+        
+        if np.array_equal(np.asarray(epsf.oversampling),
+                          np.asarray(self.oversampling)):
+            return epsf
+        
+        resampled_epsf_data = self._resample_epsf(epsf, self.oversampling)
+        
+        return self.epsf_class(data=resampled_epsf_data, oversampling=self.oversampling)
+
+    def build_epsf(self, stars, *, init_model=None):
         """
         Build iteratively an ePSF from star cutouts.
 
@@ -1033,7 +1815,7 @@ class EPSFBuilder:
         stars : `EPSFStars` object
             The stars used to build the ePSF.
 
-        init_epsf : `ImagePSF` object, optional
+        init_model : `ImagePSF` object, optional
             The initial ePSF model. If not input, then the ePSF will be
             built from scratch.
 
@@ -1048,7 +1830,7 @@ class EPSFBuilder:
         """
         iter_num = 0
         fit_failed = np.zeros(stars.n_stars, dtype=bool)
-        epsf = init_epsf
+        epsf = self._get_init_epsf(init_model)
         center_dist_sq = self.center_accuracy_sq + 1.0
         centers = stars.cutout_center_flat
 
@@ -1060,23 +1842,42 @@ class EPSFBuilder:
 
         if epsf is None:
             legacy_epsf = None
+            self.current_epsf = None
         else:
             legacy_epsf = self.epsf_class(epsf.data, flux=epsf.flux,
                                            x_0=epsf.x_0, y_0=epsf.y_0, origin=epsf.origin,
                                            oversampling=epsf.oversampling)
-            
-        # Initial constrain centres and fluxes of linked stars
-        if isinstance(stars, LinkedEPSFStar):
-            stars.constrain_linked_centres()
-            stars.constrain_linked_fluxes()
-        elif isinstance(stars, EPSFStars):
-            for star in stars.all_stars:
-                if isinstance(star, LinkedEPSFStar):
-                    star.constrain_linked_centres()
-                    star.constrain_linked_fluxes()
+            self.current_epsf = legacy_epsf.deepcopy()
 
-        while (iter_num < self.maxiters and not np.all(fit_failed)
-               and np.max(center_dist_sq) >= self.center_accuracy_sq):
+            
+        # Initial fit of the ePSF to the stars
+        if legacy_epsf is not None:
+            with warnings.catch_warnings():
+                message = '.*The fit may be unsuccessful;.*'
+                warnings.filterwarnings('ignore', message=message,
+                                        category=AstropyUserWarning)
+
+                image_psf = self.epsf_class(data=legacy_epsf.data,
+                                     origin=legacy_epsf.origin,
+                                     oversampling=legacy_epsf.oversampling,
+                                     fill_value=legacy_epsf.fill_value)
+
+                stars = self.fitter(image_psf, stars)
+
+        ppe_map = self._generate_ppe_map(stars)
+
+        if self.plot_diagnostics:
+            self._plot_star_distribution(stars)
+            ppe_map.plot_maps()
+
+        if self.calibrate_ppe:
+            stars = self._apply_ppe_corrections(stars, ppe_map, iteration=0)
+
+        if self.constrain_stars:
+            stars = self._apply_linked_star_constraints(stars, refit_flux=True)
+
+        converged = False
+        while iter_num < self.maxiters and not np.all(fit_failed):
 
             iter_num += 1
 
@@ -1089,8 +1890,19 @@ class EPSFBuilder:
                 # Restore residual smoothing after the first iteration if it was disabled
                 self.residual_smoothing = residual_smoothing_backup
 
+
+            if self.calibrate_ppe:
+                stars = self._apply_ppe_corrections(stars, ppe_map,
+                                                iteration=iter_num)
+            if self.constrain_stars:
+                stars = self._apply_linked_star_constraints(stars, refit_flux=True)
+
+
             # build/improve the ePSF
-            legacy_epsf = self._build_epsf_step(stars, epsf=legacy_epsf)
+            legacy_epsf = self._build_epsf_step(stars, epsf=legacy_epsf,
+                                                iter_num=iter_num)
+            
+            self.current_epsf = legacy_epsf.deepcopy()
 
             # fit the new ePSF to the stars to find improved centers
             # we catch fit warnings here -- stars with unsuccessful fits
@@ -1107,15 +1919,10 @@ class EPSFBuilder:
 
                 stars = self.fitter(image_psf, stars)
 
-                # Constrain centres and fluxes
-                if isinstance(stars, LinkedEPSFStar):
-                    stars.constrain_linked_centres()
-                    stars.constrain_linked_fluxes()
-                elif isinstance(stars, EPSFStars):
-                    for star in stars.all_stars:
-                        if isinstance(star, LinkedEPSFStar):
-                            star.constrain_linked_centres()
-                            star.constrain_linked_fluxes()
+            ppe_map = self._generate_ppe_map(stars)
+
+            if self.plot_diagnostics:
+                ppe_map.plot_maps()
 
             # find all stars where the fit failed
             fit_failed = np.array([star._fit_error_status > 0
@@ -1131,6 +1938,64 @@ class EPSFBuilder:
                 for i in idx:  # pylint: disable=not-an-iterable
                     stars.all_stars[i]._excluded_from_fit = True
 
+            # Find the stars which have outlier fitting errors - probably bad stars
+            # NOTE: Only do after 3 iterations
+            if iter_num > 3:
+                sigma_ff = []
+                sigma_x = []
+                sigma_y = []
+                for star in stars.all_good_stars:
+                    s_ff = None
+                    s_x = None
+                    s_y = None
+                    if hasattr(star, '_fit_info'):
+                        if "param_cov" in star._fit_info.keys():
+                            cov = star._fit_info["param_cov"]
+                            if cov is not None:
+                                s_ff = np.sqrt(cov[0, 0]) / star.flux
+                                s_x = np.sqrt(cov[1, 1])
+                                s_y = np.sqrt(cov[2, 2])
+                            else:
+                                jac = star._fit_info["jac"]
+                                cost = star._fit_info["cost"]
+                                n_data, n_par = jac.shape
+                                sigma2 = 2 * cost / (n_data - n_par)
+                                try:
+                                    cov = sigma2 * np.linalg.inv(jac.T @ jac)
+                                    s_ff = np.sqrt(cov[0, 0]) / star.flux
+                                    s_x = np.sqrt(cov[1, 1])
+                                    s_y = np.sqrt(cov[2, 2])
+                                except np.linalg.LinAlgError:
+                                    cov = None
+
+                    sigma_ff.append(s_ff)
+                    sigma_x.append(s_x)
+                    sigma_y.append(s_y)
+                
+                sigma_ff = np.asarray(sigma_ff, dtype=float)
+                sigma_x = np.asarray(sigma_x, dtype=float)
+                sigma_y = np.asarray(sigma_y, dtype=float)
+
+                # 99th-percentile thresholds using only finite values
+                ff_lim = np.nanpercentile(sigma_ff[np.isfinite(sigma_ff)], 99)
+                sx_lim = np.nanpercentile(sigma_x[np.isfinite(sigma_x)], 99)
+                sy_lim = np.nanpercentile(sigma_y[np.isfinite(sigma_y)], 99)
+
+                bad = (
+                    ~np.isfinite(sigma_ff)
+                    | ~np.isfinite(sigma_x)
+                    | ~np.isfinite(sigma_y)
+                    | (sigma_ff > ff_lim)
+                    | (sigma_x > sx_lim)
+                    | (sigma_y > sy_lim)
+                )
+
+                good_stars = list(stars.all_good_stars)
+                for star, is_bad in zip(good_stars, bad):
+                    if is_bad:
+                        star._excluded_from_fit = True
+
+                        
             # if no star centers have moved by more than pixel accuracy,
             # stop the iteration loop early
             dx_dy = stars.cutout_center_flat - centers
@@ -1138,13 +2003,17 @@ class EPSFBuilder:
             center_dist_sq = np.sum(dx_dy * dx_dy, axis=1, dtype=np.float64)
             centers = stars.cutout_center_flat
 
-            self._epsf.append(legacy_epsf)
+            converged = (center_dist_sq.size > 0
+                         and np.nanmax(center_dist_sq) < self.center_accuracy_sq)
 
             if pbar is not None:
                 pbar.update()
 
+            if converged:
+                break
+
         if pbar is not None:
-            if iter_num < self.maxiters:
+            if converged:
                 pbar.write(f'EPSFBuilder converged after {iter_num} '
                            f'iterations (of {self.maxiters} maximum '
                            'iterations)')
@@ -1155,4 +2024,141 @@ class EPSFBuilder:
                         oversampling=legacy_epsf.oversampling,
                         fill_value=legacy_epsf.fill_value)
 
+        if self.calibrate_ppe:
+            stars = self._apply_ppe_corrections(stars, ppe_map, final=True)
+
         return epsf, stars
+
+
+class PPEMap:
+    def __init__(self, supersampling, flux_ppe, x_ppe, y_ppe):
+        self.supersampling = supersampling
+        self.flux_ppe = flux_ppe
+        self.x_ppe = x_ppe
+        self.y_ppe = y_ppe
+
+    @staticmethod
+    def _sample_periodic_map(ppe_map, x, y, supersampling):
+        """
+        Bilinearly interpolate a periodic supersampled PPE map.
+        """
+        xphase = np.mod(x, 1.0)
+        yphase = np.mod(y, 1.0)
+
+        xcoord = xphase * supersampling[1] - 0.5
+        ycoord = yphase * supersampling[0] - 0.5
+
+        x0 = np.floor(xcoord).astype(int)
+        y0 = np.floor(ycoord).astype(int)
+        dx = xcoord - x0
+        dy = ycoord - y0
+
+        x0 %= supersampling[1]
+        y0 %= supersampling[0]
+        x1 = (x0 + 1) % supersampling[1]
+        y1 = (y0 + 1) % supersampling[0]
+
+        return ((1.0 - dx) * (1.0 - dy) * ppe_map[y0, x0]
+                + dx * (1.0 - dy) * ppe_map[y0, x1]
+                + (1.0 - dx) * dy * ppe_map[y1, x0]
+                + dx * dy * ppe_map[y1, x1])
+        
+    def __call__(self, flux, x, y):
+        """
+        Apply the PPE correction to the input flux and position measurements.
+
+        Parameters
+        ----------
+        flux : float or array-like
+            The flux measurement(s) to correct.
+
+        x : float or array-like
+            The x position measurement(s) to correct.
+
+        y : float or array-like
+            The y position measurement(s) to correct.
+
+        Returns
+        -------
+        corrected_flux : float or array-like
+            The PPE-corrected flux measurement(s).
+
+        corrected_x : float or array-like
+            The PPE-corrected x position measurement(s).
+
+        corrected_y : float or array-like
+            The PPE-corrected y position measurement(s).
+        """
+        flux_scalar = np.isscalar(flux)
+        x_scalar = np.isscalar(x)
+        y_scalar = np.isscalar(y)
+
+        flux, x, y = np.broadcast_arrays(np.asanyarray(flux, dtype=float),
+                                         np.asanyarray(x, dtype=float),
+                                         np.asanyarray(y, dtype=float))
+
+        flux_residual = self._sample_periodic_map(self.flux_ppe, x, y,
+                                                  self.supersampling)
+        x_residual = self._sample_periodic_map(self.x_ppe, x, y,
+                                               self.supersampling)
+        y_residual = self._sample_periodic_map(self.y_ppe, x, y,
+                                               self.supersampling)
+
+        flux_scale = 1.0 + flux_residual
+        invalid_flux_scale = (~np.isfinite(flux_scale)) | (flux_scale == 0.0)
+        corrected_flux = np.array(flux, copy=True)
+        np.divide(flux, flux_scale, out=corrected_flux,
+                  where=~invalid_flux_scale)
+
+        x_residual = np.where(np.isfinite(x_residual), x_residual, 0.0)
+        y_residual = np.where(np.isfinite(y_residual), y_residual, 0.0)
+        corrected_x = x - x_residual
+        corrected_y = y - y_residual
+
+        if flux_scalar and x_scalar and y_scalar:
+            return corrected_flux.item(), corrected_x.item(), corrected_y.item()
+
+        return corrected_flux, corrected_x, corrected_y
+    
+    def plot_maps(self):
+        """
+        Plot the PPE maps for visual inspection.
+        """
+        import matplotlib.pyplot as plt
+
+        # Define the subpixel x and y positions over which to sample the maps
+        sample_factor = 3
+
+        yphase = np.linspace(0.0, 1.0, self.supersampling[0] * sample_factor,
+                             endpoint=False)
+        xphase = np.linspace(0.0, 1.0, self.supersampling[1] * sample_factor,
+                             endpoint=False)
+        xx, yy = np.meshgrid(xphase, yphase)
+
+        # Evaluate the flux, x, and y PPE maps at these positions
+        flux_map = self._sample_periodic_map(self.flux_ppe, xx, yy,
+                                             self.supersampling)
+        x_map = self._sample_periodic_map(self.x_ppe, xx, yy,
+                                          self.supersampling)
+        y_map = self._sample_periodic_map(self.y_ppe, xx, yy,
+                                          self.supersampling)
+
+        # Plot the maps as three subplots each with their own colorbar
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+
+        map_data = (
+            (flux_map, 'Flux PPE', 'Fractional flux residual'),
+            (x_map, 'X PPE', 'X residual (pixels)'),
+            (y_map, 'Y PPE', 'Y residual (pixels)'),
+        )
+        extent = (0.0, 1.0, 0.0, 1.0)
+
+        for ax, (data, title, cbar_label) in zip(axes, map_data):
+            im = ax.imshow(data, origin='lower', extent=extent, cmap='coolwarm',
+                           aspect='equal')
+            ax.set_title(title)
+            ax.set_xlabel('Subpixel x phase')
+            ax.set_ylabel('Subpixel y phase')
+            fig.colorbar(im, ax=ax, label=cbar_label)
+
+        return fig

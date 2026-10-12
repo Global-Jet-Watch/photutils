@@ -61,10 +61,27 @@ class EPSFStar:
 
     id_label : int, str, or `None`, optional
         An optional identification number or label for the star.
+
+    frame_id : int, str, or `None`, optional
+        An optional identifier for the image/exposure/frame from which
+        the star cutout was extracted.
+
+    exposure_time : float or `None`, optional
+        The exposure time associated with the star cutout. This is
+        intended for workflows where cutout data are exposure-time
+        normalized, but flux-dependent PSF systematics should use
+        time-integrated flux.
+
+    fwhm : float or `None`, optional
+        The image FWHM associated with the star cutout. This is a
+        placeholder metadata value for workflows where the ePSF model
+        depends on image FWHM.
     """
 
     def __init__(self, data, *, weights=None, cutout_center=None,
-                 origin=(0, 0), wcs_large=None, id_label=None):
+                 origin=(0, 0), wcs_large=None, id_label=None,
+                 frame_id=None, exposure_time=None, fwhm=None,
+                 flux=None):
 
         self._data = np.asanyarray(data)
         self.shape = self._data.shape
@@ -90,8 +107,30 @@ class EPSFStar:
         self.origin = np.asarray(origin)
         self.wcs_large = wcs_large
         self.id_label = id_label
+        self.frame_id = frame_id
 
-        self.flux = self.estimate_flux()
+        if exposure_time is None:
+            self.exposure_time = None
+        else:
+            exposure_time = float(exposure_time)
+            if not np.isfinite(exposure_time) or exposure_time <= 0.0:
+                raise ValueError('exposure_time must be a finite positive '
+                                 'number or None')
+            self.exposure_time = exposure_time
+
+        if fwhm is None:
+            self.fwhm = None
+        else:
+            fwhm = float(fwhm)
+            if not np.isfinite(fwhm) or fwhm <= 0.0:
+                raise ValueError('fwhm must be a finite positive number '
+                                 'or None')
+            self.fwhm = fwhm
+
+        if flux is None:
+            self.flux = self.estimate_flux()
+        else:
+            self.flux = float(flux)
 
         self._excluded_from_fit = False
         self._fitinfo = None
@@ -347,7 +386,7 @@ class EPSFStars:
 
     def __getattr__(self, attr):
         if attr in ['cutout_center', 'center', 'flux',
-                    '_excluded_from_fit']:
+                    'exposure_time', 'fwhm', '_excluded_from_fit']:
             result = np.array([getattr(star, attr) for star in self._data])
         else:
             result = [getattr(star, attr) for star in self._data]
@@ -382,16 +421,23 @@ class EPSFStars:
                 continue
             linked_star.constrain_fluxes()
 
-    def constrain_linked_centres(self):
-        """ Constrain the centres of any `LinkedEPSFStar` objects in this list 
-        to have the same sky coordinates. The single sky coordinate is 
+    def constrain_linked_centres(self, remove_outliers=False):
+        """
+        Constrain the centres of any `LinkedEPSFStar` objects in this list
+        to have the same sky coordinates. The single sky coordinate is
         calculated as the mean of sky coordinates of the linked stars.
+
+        Parameters
+        ----------
+        remove_outliers : bool, optional
+            If `True`, iteratively sigma-clip linked-star center distances
+            before calculating the mean sky coordinate.
         """
 
         for linked_star in self._data:
             if not isinstance(linked_star, LinkedEPSFStar):
                 continue
-            linked_star.constrain_centers()
+            linked_star.constrain_centers(remove_outliers=remove_outliers)
 
     @property
     def cutout_center_flat(self):
@@ -517,7 +563,7 @@ class LinkedEPSFStar(EPSFStars):
 
         super().__init__(stars_list)
 
-    def constrain_centers(self):
+    def constrain_centers(self, remove_outliers=False):
         """
         Constrain the centers of linked `EPSFStar` objects (i.e., the
         same physical star) to have the same sky coordinate.
@@ -527,9 +573,94 @@ class LinkedEPSFStar(EPSFStars):
 
         The single sky coordinate is calculated as the mean of sky
         coordinates of the linked stars.
+
+        Parameters
+        ----------
+        remove_outliers : bool, optional
+            If `True`, iteratively sigma-clip linked-star center distances
+            from the current mean sky coordinate before recalculating the
+            mean. Outlier stars are not recentered.
         """
         if len(self._data) < 2:  # no linked stars
             return
+
+        idx = np.logical_not(self._excluded_from_fit).nonzero()[0]
+        if idx.shape == (0,):  # pylint: disable=no-member
+            warnings.warn('Cannot constrain centers of linked stars because '
+                          'all the stars have been excluded during the ePSF '
+                          'build process.', AstropyUserWarning)
+            return
+
+        good_stars = [self._data[i]
+                      for i in idx]  # pylint: disable=not-an-iterable
+
+        coords = []
+        for star in good_stars:
+            wcs = star.wcs_large
+            xposition = star.center[0]
+            yposition = star.center[1]
+            coords.append(wcs.pixel_to_world_values(xposition, yposition))
+
+        # compute mean cartesian coordinates
+        lon, lat = np.transpose(coords)
+        lon *= np.pi / 180.0
+        lat *= np.pi / 180.0
+        x = np.cos(lat) * np.cos(lon)
+        y = np.cos(lat) * np.sin(lon)
+        z = np.sin(lat)
+        x_mean = np.mean(x)
+        y_mean = np.mean(y)
+        z_mean = np.mean(z)
+
+        if remove_outliers:
+            # compute distances from mean cartesian coordinates
+            distances = np.sqrt(
+                (x - x_mean) ** 2 + (y - y_mean) ** 2 + (z - z_mean) ** 2
+            )
+
+            # find distance outliers with iterative sigma-clipping
+            keep = np.ones(distances.shape, dtype=bool)
+            for _ in range(10):
+                if np.count_nonzero(keep) < 3:
+                    break
+                clipped_distances = distances[keep]
+                center = np.median(clipped_distances)
+                scale = np.std(clipped_distances)
+                if not np.isfinite(scale) or scale <= 0.0:
+                    break
+                threshold = center + 3.0 * scale
+                keep_new = keep & (distances <= threshold)
+                if np.array_equal(keep, keep_new):
+                    break
+                if not np.any(keep_new):
+                    break
+                keep = keep_new
+
+            if np.any(keep) and not np.all(keep):
+                # update mean cartesian coordinates after outlier rejection
+                x_mean = np.mean(x[keep])
+                y_mean = np.mean(y[keep])
+                z_mean = np.mean(z[keep])
+
+                # remove outlier stars from good stars
+                good_stars = [star for star, keep_star in
+                              zip(good_stars, keep, strict=True)
+                              if keep_star]
+
+        # convert mean cartesian coordinates back to spherical
+        hypot = np.hypot(x_mean, y_mean)
+        mean_lon = np.arctan2(y_mean, x_mean)
+        mean_lat = np.arctan2(z_mean, hypot)
+        mean_lon *= 180.0 / np.pi
+        mean_lat *= 180.0 / np.pi
+
+        # convert mean sky coordinates back to center pixel coordinates
+        # for each star
+        for star in good_stars:
+            center = star.wcs_large.world_to_pixel_values(mean_lon, mean_lat)
+            star.cutout_center = np.array(center) - star.origin
+
+    def get_mean_radec(self):
 
         idx = np.logical_not(self._excluded_from_fit).nonzero()[0]
         if idx.shape == (0,):  # pylint: disable=no-member
@@ -563,11 +694,8 @@ class LinkedEPSFStar(EPSFStars):
         mean_lon *= 180.0 / np.pi
         mean_lat *= 180.0 / np.pi
 
-        # convert mean sky coordinates back to center pixel coordinates
-        # for each star
-        for star in good_stars:
-            center = star.wcs_large.world_to_pixel_values(mean_lon, mean_lat)
-            star.cutout_center = np.array(center) - star.origin
+        return mean_lon, mean_lat
+
 
     def constrain_fluxes(self):
         """
@@ -602,6 +730,27 @@ class LinkedEPSFStar(EPSFStars):
         # set the flux of each star to the mean flux
         for star in good_stars:
             star.flux = mean_flux
+
+    def get_mean_flux(self):
+
+        idx = np.logical_not(self._excluded_from_fit).nonzero()[0]
+        if idx.shape == (0,):  # pylint: disable=no-member
+            warnings.warn('Cannot get mean flux of linked stars because '
+                          'all the stars have been excluded during the ePSF '
+                          'build process.', AstropyUserWarning)
+            return
+
+        good_stars = [self._data[i]
+                      for i in idx]  # pylint: disable=not-an-iterable
+
+        fluxes = []
+        for star in good_stars:
+            fluxes.append(star.flux)
+
+        # compute mean flux
+        mean_flux = np.mean(fluxes)
+
+        return mean_flux
 
 
 def extract_stars(data, catalogs, *, size=(11, 11)):

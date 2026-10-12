@@ -152,6 +152,26 @@ class TestLinkedStars:
             centers = [star.center for star in linked_star]
             assert np.all(centers == centers[0])
 
+    def test_constrain_centers_remove_outliers(self):
+        data = np.ones((3, 3), dtype=float)
+        linked_stars_list = [
+            EPSFStar(data, cutout_center=(1.0, 1.0), origin=(14, 14),
+                     wcs_large=self.wcs_map)
+            for _ in range(20)
+        ]
+        linked_stars_list.append(
+            EPSFStar(data, cutout_center=(1.0, 1.0), origin=(39, 14),
+                     wcs_large=self.wcs_map)
+        )
+
+        linked_star = LinkedEPSFStar(linked_stars_list)
+        linked_stars = EPSFStars([linked_star])
+        linked_stars.constrain_linked_centres(remove_outliers=True)
+
+        for star in linked_star._data[:-1]:
+            assert_allclose(star.center, (15.0, 15.0))
+        assert_allclose(linked_star._data[-1].center, (40.0, 15.0))
+
 def test_epsf_star_residual_image():
     """
     Test to ensure ``compute_residual_image`` gives correct residuals.
@@ -174,6 +194,15 @@ def test_epsf_star_residual_image():
     # conversion to ePSF, and spline fitting (twice), so assert_allclose
     # cannot be more precise than 0.001 currently.
     assert_allclose(np.sum(residual), 0.0, atol=1.0e-3, rtol=1e-3)
+
+
+def test_epsf_star_fwhm_metadata():
+    star = EPSFStar(np.ones((5, 5), dtype=float), fwhm=2.5)
+
+    assert star.fwhm == 2.5
+
+    with pytest.raises(ValueError, match='fwhm must be'):
+        EPSFStar(np.ones((5, 5), dtype=float), fwhm=0.0)
 
 
 def test_stars_pickleable():
