@@ -313,3 +313,99 @@ The :class:`~photutils.psf.EPSFModel` object is a subclass of
 as a PSF model for the :ref:`PSF-fitting machinery in Photutils
 <psf-photometry>` (i.e., `~photutils.psf.PSFPhotometry` or
 `~photutils.psf.IterativePSFPhotometry`).
+
+
+Spatially varying ePSFs
+-----------------------
+
+The standard :class:`~photutils.psf.EPSFBuilder` constructs one ePSF
+for the whole image. If the PSF changes across the detector, use a
+spatially varying builder instead. The
+:class:`~photutils.psf.GriddedEPSFBuilder` builds a separate ePSF in
+each cell of a regular detector grid. It returns a
+:class:`~photutils.psf.GriddedPSFModel`, which interpolates between the
+grid ePSFs when evaluated at a source position. Choose a grid that
+balances spatial resolution against the number of suitable stars in
+each cell; cells with too few stars are not independently updated.
+
+The builder uses the detector shape and grid shape in ``(y, x)`` order.
+It takes the same :class:`~photutils.psf.EPSFStars` input produced by
+:func:`~photutils.psf.extract_stars`::
+
+    >>> from photutils.psf import GriddedEPSFBuilder
+    >>> builder = GriddedEPSFBuilder(image_shape=data.shape,
+    ...                              grid_shape=(4, 4), oversampling=4,
+    ...                              maxiters=5, progress_bar=False)
+    >>> gridded_epsf = builder(stars)
+
+The result can be supplied directly as the PSF model to
+:class:`~photutils.psf.PSFPhotometry` or
+:class:`~photutils.psf.IterativePSFPhotometry`. A
+:class:`~photutils.psf.GriddedEPSFFitter` can fit stars using the local
+interpolated ePSF; set ``forced_photometry=True`` to hold linked-star
+positions fixed and fit their fluxes only.
+
+
+Polynomial spatial ePSFs
+------------------------
+
+For smoothly varying PSFs, :class:`~photutils.psf.SpatialEPSFBuilder`
+models each oversampled ePSF sample as a low-order polynomial of
+detector position. Unlike the gridded builder, it produces a continuous
+position-dependent model rather than separate local ePSFs. The builder
+returns the model and the fitted stars::
+
+    >>> from photutils.psf import SpatialEPSFBuilder
+    >>> spatial_builder = SpatialEPSFBuilder(oversampling=4, degree=1,
+    ...                                      detector_shape=data.shape,
+    ...                                      maxiters=5)
+    >>> spatial_epsf, fitted_stars = spatial_builder(stars)
+
+The degree can be 0, 1, or 2. Supplying ``detector_shape`` gives the
+model the detector coordinate range explicitly. To inspect or use the
+local PSF at detector coordinates ``(x, y)``, call
+``spatial_epsf.make_image_psf(x, y)``. To fit stars with the spatial
+model, use :class:`~photutils.psf.SpatialEPSFFitter`.
+
+
+Variable ePSFs
+--------------
+
+The experimental :class:`~photutils.psf.VariableEPSFBuilder` extends
+the spatial model to describe changes correlated with source flux
+and/or image FWHM, in addition to detector position. The dependency
+terms are selected with ``dependencies``; for example, a model that
+varies with position and flux can be built as follows::
+
+    >>> from photutils.psf import VariableEPSFBuilder
+    >>> variable_builder = VariableEPSFBuilder(
+    ...     dependencies=('Position', 'Flux'), detector_shape=data.shape,
+    ...     oversampling=4, maxiters=5)
+    >>> variable_epsf, fitted_stars = variable_builder(stars)
+
+Flux-dependent models need stars spanning the flux range of interest.
+FWHM-dependent models likewise need representative FWHM information on
+the input stars. When the input stars are linked across images,
+``forced_photometry=True`` in the associated fitter holds their
+positions fixed while fitting fluxes. This builder is a prototype; its
+results should be validated for the data and range of conditions where
+the model will be applied.
+
+
+Estimating ePSF model error
+---------------------------
+
+The :func:`~photutils.psf.calc_epsf_error` function estimates an
+oversampled model-error map from the residuals between an ePSF and a
+collection of stars. It supports image, gridded, spatial, and variable
+ePSF models. By default it fits the model to the stars before forming
+the residuals::
+
+    >>> from photutils.psf import calc_epsf_error
+    >>> error_map = calc_epsf_error(epsf, stars)
+
+The returned :class:`~photutils.psf.EPSFErrorMap` stores the standard
+deviation in ``data`` and the corresponding ``variance``. Pixels with
+too few residual samples are set to zero; adjust ``min_samples`` to
+control that threshold. Use ``fit_stars=False`` when the star cutouts
+already contain suitable fitted fluxes and positions.
