@@ -35,6 +35,10 @@ Bug Fixes
 
 - ``photutils.psf``
 
+  - Refit stars against the completed spatial and variable ePSF models so
+    returned fitted-star parameters match the returned model; derive final
+    PPE corrections from those fits while preserving linked-star constraints.
+
   - Corrected forced photometry for supported PSF model types, improved
     handling of saturated stars and fit uncertainties, and made spatial
     coefficient interpolation preserve non-negativity when requested.

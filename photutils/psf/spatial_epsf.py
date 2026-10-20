@@ -900,7 +900,9 @@ class SpatialEPSFBuilder:
 
     Linked stars can optionally be constrained after each fit iteration
     to share a common mean sky position and/or mean flux before the
-    residual stack is formed.
+    residual stack is formed. The returned ``fitted_stars`` are fitted
+    against the returned final model; when PPE calibration is enabled,
+    they include PPE corrections computed from that final-model fit.
 
     If ``detector_shape`` is not provided, then the detector-coordinate
     normalization is inferred from the distribution of the input star
@@ -3162,6 +3164,17 @@ class SpatialEPSFBuilder:
                 break
 
             stars = fitted_stars
+
+        # Refit against the completed model so the returned model/star pair
+        # describes the same iteration. Recompute PPE from these raw fits.
+        self._log('SpatialEPSFBuilder: fitting stars to final model')
+        fitted_stars_raw = self.fitter(spatial_model, stars)
+        spatial_ppe_model = self._fit_spatial_ppe_model(fitted_stars_raw)
+        self._ppe_models.append(spatial_ppe_model)
+        self.final_ppe_model = spatial_ppe_model
+        fitted_stars_corrected = self._apply_spatial_ppe_corrections(
+            fitted_stars_raw, spatial_ppe_model)
+        stars = self._apply_linked_constraints(fitted_stars_corrected)
 
         self._log('SpatialEPSFBuilder: finished')
 

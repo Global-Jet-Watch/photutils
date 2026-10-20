@@ -8,10 +8,84 @@ import pytest
 from astropy.utils.exceptions import AstropyUserWarning
 from numpy.testing import assert_allclose
 
-from photutils.psf.epsf_stars import EPSFStar, EPSFStars
+from photutils.psf.epsf_stars import EPSFStar, EPSFStars, LinkedEPSFStar
+from photutils.psf.spatial_epsf import SpatialEPSFFitter
 from photutils.psf.variable_epsf import VariableEPSFBuilder
 from photutils.psf.variable_epsf import VariableEPSFFitter
 from photutils.psf.variable_epsf import VariableEPSFModel
+
+
+def test_variable_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
+    stars = EPSFStars([EPSFStar(np.ones((5, 5), dtype=float),
+                                cutout_center=(2.0, 2.0))])
+    builder = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        detector_shape=(10, 10), oversampling=2, degree=0, maxiters=1,
+        residual_min_valid_samples=1, residual_outlier_clip=None,
+        calibrate_ppe=('Position', 'Flux'), constrain_stars=(),
+        recenter_epsf=False, normalise_epsf=False,
+        residual_smoothing_kernel=None, smoothing_kernel=None)
+    seen = []
+
+    def fit(model, input_stars):
+        seen.append(model)
+        return EPSFStars([EPSFStar(np.ones((5, 5)), cutout_center=(2, 2),
+                                   flux=10.0 + len(seen))])
+
+    class PPE:
+        def __call__(self, flux, x, y, **kwargs):
+            return flux + 5.0, x + 0.25, y + 0.5
+
+    monkeypatch.setattr(builder, 'variable_fitter', fit)
+    monkeypatch.setattr(builder, '_fit_spatial_ppe_model',
+                        lambda fitted: PPE())
+    monkeypatch.setattr(builder, '_resample_residuals',
+                        lambda *args: (np.zeros((1, 5, 5)),
+                                       np.ones((1, 5, 5)),
+                                       np.zeros((1, 5, 5)),
+                                       np.zeros((1, 5, 5)),
+                                       np.zeros((1, 5, 5), dtype=bool),
+                                       np.array([2.]), np.array([2.]),
+                                       np.array([0])))
+    monkeypatch.setattr(builder, '_fit_residual_coefficients',
+                        lambda *args, **kwargs: np.zeros((1, 11, 11)))
+    monkeypatch.setattr(builder, '_compute_trust_map_from_residuals',
+                        lambda *args: np.ones((11, 11)))
+    monkeypatch.setattr(builder, '_underconstrained_residual_mask',
+                        lambda *args, **kwargs: np.zeros((11, 11), dtype=bool))
+
+    model, fitted = builder.build_epsf(stars)
+
+    assert len(seen) == 2
+    assert seen[-1] is model
+    assert_allclose(fitted[0].flux, 17.0)
+    assert_allclose(fitted[0].cutout_center, (2.25, 2.5))
+
+
+def test_variable_epsf_builder_final_refit_preserves_linked_stars():
+    from astropy.wcs import WCS
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [1.0, 1.0]
+    wcs.wcs.cdelt = [1.0, 1.0]
+    wcs.wcs.crval = [0.0, 0.0]
+    wcs.wcs.ctype = ['LINEAR', 'LINEAR']
+    stars = EPSFStars([LinkedEPSFStar([
+        EPSFStar(np.ones((5, 5)), cutout_center=(2, 2), wcs_large=wcs),
+        EPSFStar(np.ones((5, 5)), cutout_center=(2, 2), wcs_large=wcs)])])
+    builder = VariableEPSFBuilder(
+        dependencies=('Position',), fit_dependencies=('Position',),
+        detector_shape=(10, 10), oversampling=2, degree=0, maxiters=1,
+        residual_min_valid_samples=1, residual_outlier_clip=None,
+        calibrate_ppe=(), constrain_stars=('Position', 'Flux'),
+        recenter_epsf=False, normalise_epsf=False,
+        residual_smoothing_kernel=None, smoothing_kernel=None)
+    with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
+        _, fitted = builder.build_epsf(stars)
+    assert isinstance(fitted._data[0], LinkedEPSFStar)
+    assert_allclose(fitted._data[0].cutout_center_flat[0],
+                    fitted._data[0].cutout_center_flat[1])
+    assert_allclose(fitted._data[0].flux[0], fitted._data[0].flux[1])
 
 
 def test_variable_epsf_model_fwhm_dependency():
