@@ -17,10 +17,9 @@ from numpy.testing import assert_allclose
 
 from photutils.datasets import make_model_image
 from photutils.psf import CircularGaussianPRF, make_psf_model_image
-from photutils.psf.epsf import EPSFBuilder, EPSFFitter, PPEMap
+from photutils.psf.epsf import EPSFBuilder, EPSFFitter
 from photutils.psf.epsf_stars import EPSFStar, EPSFStars, extract_stars
 from photutils.psf.image_models import ImagePSF
-from photutils.utils._optional_deps import HAS_MATPLOTLIB
 
 
 @pytest.fixture
@@ -110,8 +109,15 @@ class TestEPSFBuild:
         stars = extract_stars(epsf_test_data['nddata'],
                               epsf_test_data['init_stars'][:10],
                               size=shape)
+
+        class TrackingFitter(EPSFFitter):
+            def __call__(self, model, stars):
+                self.last_model_data = model.data.copy()
+                return super().__call__(model, stars)
+
+        fitter = TrackingFitter()
         epsf_builder = EPSFBuilder(oversampling=oversampling, maxiters=5,
-                                   progress_bar=False)
+                                   progress_bar=False, fitter=fitter)
         epsf, fitted_stars = epsf_builder(stars)
 
         ref_size = np.array(shape) * oversampling + 1
@@ -121,6 +127,8 @@ class TestEPSFBuild:
         assert len(fitted_stars) == 10
         assert epsf.data.sum() > 2  # Check it has reasonable total flux
         assert epsf.data.max() > 0.01  # Should have a peak
+
+        assert_allclose(fitter.last_model_data, epsf.data)
 
         # Check that the center region has higher values than edges
         center_y, center_x = np.array(ref_size) // 2
@@ -225,9 +233,6 @@ def test_epsfbuilder_inputs():
     match = 'oversampling must be > 0'
     with pytest.raises(ValueError, match=match):
         EPSFBuilder(oversampling=[-1, 4])
-    match = "calibrate_ppe entries must be 'Flux' and/or 'Position'"
-    with pytest.raises(ValueError, match=match):
-        EPSFBuilder(calibrate_ppe=('Flux', 'Bad'))
     match = "constrain_stars entries must be 'Flux' and/or 'Position'"
     with pytest.raises(ValueError, match=match):
         EPSFBuilder(constrain_stars=('Flux', 'Bad'))
@@ -245,6 +250,8 @@ def test_epsfbuilder_inputs():
         EPSFBuilder(pixel_interpolation_method='invalid')
     with pytest.raises(TypeError, match='unexpected keyword argument'):
         EPSFBuilder(convergence_mode='model')
+    with pytest.raises(TypeError, match='unexpected keyword argument'):
+        EPSFBuilder(calibrate_ppe=('Position',))
     with pytest.raises(TypeError, match='unexpected keyword argument'):
         EPSFBuilder(center_convergence_percentile=90.0)
     with pytest.raises(TypeError, match='unexpected keyword argument'):
@@ -286,7 +293,6 @@ def test_epsfbuilder_inputs():
     EPSFBuilder(recenter_epsf=False)
     with pytest.raises(TypeError, match='unexpected keyword argument'):
         EPSFBuilder(clip_negative=False)
-    EPSFBuilder(calibrate_ppe=('Position',))
     EPSFBuilder(constrain_stars=('Position',))
     EPSFBuilder(plot_diagnostics=False)
     EPSFBuilder(residual_star_rms_clip=None, residual_outlier_clip=3.0,
@@ -318,7 +324,6 @@ def test_epsfbuilder_inputs():
     assert not hasattr(builder, 'flux_ppe_update_every')
     assert not hasattr(builder, '_sigma_clip')
     assert builder.recenter_epsf is True
-    assert builder.calibrate_ppe == ('Flux', 'Position')
     assert builder.constrain_stars == ('Flux', 'Position')
     assert builder.plot_diagnostics is True
 
@@ -379,50 +384,6 @@ def test_resample_epsf_anisotropic_grid():
     assert_allclose(resampled, expected, atol=1e-8)
 
 
-def test_apply_ppe_corrections_policy():
-    star = EPSFStar(np.ones((5, 5), dtype=float), cutout_center=(2.0, 2.0),
-                    origin=(10, 20))
-    stars = EPSFStars([star])
-    builder = EPSFBuilder(oversampling=2, maxiters=1, progress_bar=False,
-                          calibrate_ppe=('Flux', 'Position'))
-
-    ppemap = PPEMap((2, 2),
-                    np.full((2, 2), 0.2),
-                    np.full((2, 2), 0.25),
-                    np.full((2, 2), -0.5))
-
-    corrected_iter1 = builder._apply_ppe_corrections(stars, ppemap,
-                                                     iteration=1)
-    assert_allclose(corrected_iter1[0].flux, star.flux / 1.2 * 0.8
-                    + star.flux * 0.2)
-    assert_allclose(corrected_iter1[0].center, (11.75, 22.5))
-
-    corrected_iter2 = builder._apply_ppe_corrections(stars, ppemap,
-                                                     iteration=2)
-    assert_allclose(corrected_iter2[0].flux, star.flux / 1.2 * 0.8
-                    + star.flux * 0.2)
-    assert_allclose(corrected_iter2[0].center, (11.75, 22.5))
-
-    corrected_final = builder._apply_ppe_corrections(stars, ppemap,
-                                                     final=True)
-    assert_allclose(corrected_final[0].flux, star.flux / 1.2)
-    assert_allclose(corrected_final[0].center, (11.75, 22.5))
-
-    flux_only_builder = EPSFBuilder(oversampling=2, maxiters=1,
-                                    progress_bar=False,
-                                    calibrate_ppe=('Flux',))
-    corrected_flux_only = flux_only_builder._apply_ppe_corrections(
-        stars, ppemap, final=True)
-    assert_allclose(corrected_flux_only[0].flux, star.flux / 1.2)
-    assert_allclose(corrected_flux_only[0].center, star.center)
-
-    position_only_builder = EPSFBuilder(oversampling=2, maxiters=1,
-                                        progress_bar=False,
-                                        calibrate_ppe=('Position',))
-    corrected_position_only = position_only_builder._apply_ppe_corrections(
-        stars, ppemap, final=True)
-    assert_allclose(corrected_position_only[0].flux, star.flux)
-    assert_allclose(corrected_position_only[0].center, (11.75, 22.5))
 
 
 def test_apply_linked_star_constraints_policy():
@@ -454,24 +415,3 @@ def test_apply_linked_star_constraints_policy():
                           constrain_stars=('Flux', 'Position'))
     builder._apply_linked_star_constraints(stars)
     assert stars.calls == ['Position', 'Flux']
-
-
-@pytest.mark.skipif(not HAS_MATPLOTLIB, reason='matplotlib is required')
-def test_ppemap_plot_maps():
-    import matplotlib.pyplot as plt
-
-    ppemap = PPEMap((2, 3),
-                    np.array([[0.1, 0.2, 0.3],
-                              [0.4, 0.5, 0.6]]),
-                    np.array([[0.0, 0.1, 0.0],
-                              [-0.1, 0.0, 0.1]]),
-                    np.array([[0.05, 0.0, -0.05],
-                              [0.1, 0.0, -0.1]]))
-
-    fig = ppemap.plot_maps()
-
-    assert len(fig.axes) == 6
-    assert [ax.get_title() for ax in fig.axes[:3]] == ['Flux PPE', 'X PPE',
-                                                        'Y PPE']
-
-    plt.close(fig)

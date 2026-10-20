@@ -15,14 +15,68 @@ from photutils.psf.variable_epsf import VariableEPSFFitter
 from photutils.psf.variable_epsf import VariableEPSFModel
 
 
-def test_variable_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
+def test_variable_epsf_builder_final_fit_with_flux_and_fwhm_dependencies(
+        monkeypatch):
+    stars = []
+    for flux, fwhm in ((10.0, 2.0), (20.0, 3.0)):
+        star = EPSFStar(np.ones((5, 5), dtype=float),
+                        cutout_center=(2.0, 2.0), fwhm=fwhm)
+        star.flux = flux
+        stars.append(star)
+    stars = EPSFStars(stars)
+
+    coeff = np.ones((1, 11, 11), dtype=float)
+    init_model = VariableEPSFModel(
+        spatial_coeff_data=coeff, oversampling=2, detector_shape=(10, 10),
+        degree=0, dependencies=('Position', 'Flux', 'FWHM'),
+        flux_coeff_data=np.zeros_like(coeff), flux_degree=1,
+        flux_reference=10.0, flux_scale=10.0,
+        fwhm_coeff_data=np.zeros_like(coeff), fwhm_degree=1,
+        fwhm_reference=2.0, fwhm_scale=1.0,
+        normalize_local_epsf=False)
+    builder = VariableEPSFBuilder(
+        dependencies=('Position', 'Flux', 'FWHM'), fit_dependencies=(),
+        detector_shape=(10, 10), oversampling=2, degree=0, maxiters=1,
+        normalise_epsf=False, recenter_epsf=False,
+        residual_smoothing_kernel=None, smoothing_kernel=None,
+        use_time_integrated_flux=False)
+    fitted_models = []
+
+    def fit(model, input_stars):
+        fitted_models.append(model)
+        return input_stars
+
+    monkeypatch.setattr(builder, 'variable_fitter', fit)
+    monkeypatch.setattr(builder, '_resample_residuals',
+                        lambda *args: (np.zeros((2, 5, 5)),
+                                       np.ones((2, 5, 5)),
+                                       np.zeros((2, 5, 5)),
+                                       np.zeros((2, 5, 5)),
+                                       np.zeros((2, 5, 5), dtype=bool),
+                                       np.array([2.0, 3.0]),
+                                       np.array([2.0, 3.0]),
+                                       np.array([0, 1])))
+    monkeypatch.setattr(builder, '_compute_trust_map_from_residuals',
+                        lambda *args: np.ones((11, 11)))
+
+    model, fitted = builder.build_epsf(stars, init_model=init_model)
+
+    assert len(fitted_models) == 2
+    assert fitted_models[-1] is model
+    assert model.has_flux_dependency
+    assert model.has_fwhm_dependency
+    assert_allclose(fitted._getattr_flat('flux'), (10.0, 20.0))
+
+
+def test_variable_epsf_builder_returns_final_model_fits_without_correction(
+        monkeypatch):
     stars = EPSFStars([EPSFStar(np.ones((5, 5), dtype=float),
                                 cutout_center=(2.0, 2.0))])
     builder = VariableEPSFBuilder(
         dependencies=('Position',), fit_dependencies=('Position',),
         detector_shape=(10, 10), oversampling=2, degree=0, maxiters=1,
         residual_min_valid_samples=1, residual_outlier_clip=None,
-        calibrate_ppe=('Position', 'Flux'), constrain_stars=(),
+        constrain_stars=(),
         recenter_epsf=False, normalise_epsf=False,
         residual_smoothing_kernel=None, smoothing_kernel=None)
     seen = []
@@ -32,13 +86,7 @@ def test_variable_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
         return EPSFStars([EPSFStar(np.ones((5, 5)), cutout_center=(2, 2),
                                    flux=10.0 + len(seen))])
 
-    class PPE:
-        def __call__(self, flux, x, y, **kwargs):
-            return flux + 5.0, x + 0.25, y + 0.5
-
     monkeypatch.setattr(builder, 'variable_fitter', fit)
-    monkeypatch.setattr(builder, '_fit_spatial_ppe_model',
-                        lambda fitted: PPE())
     monkeypatch.setattr(builder, '_resample_residuals',
                         lambda *args: (np.zeros((1, 5, 5)),
                                        np.ones((1, 5, 5)),
@@ -58,8 +106,8 @@ def test_variable_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
 
     assert len(seen) == 2
     assert seen[-1] is model
-    assert_allclose(fitted[0].flux, 17.0)
-    assert_allclose(fitted[0].cutout_center, (2.25, 2.5))
+    assert_allclose(fitted[0].flux, 12.0)
+    assert_allclose(fitted[0].cutout_center, (2.0, 2.0))
 
 
 def test_variable_epsf_builder_final_refit_preserves_linked_stars():
@@ -77,7 +125,7 @@ def test_variable_epsf_builder_final_refit_preserves_linked_stars():
         dependencies=('Position',), fit_dependencies=('Position',),
         detector_shape=(10, 10), oversampling=2, degree=0, maxiters=1,
         residual_min_valid_samples=1, residual_outlier_clip=None,
-        calibrate_ppe=(), constrain_stars=('Position', 'Flux'),
+        constrain_stars=('Position', 'Flux'),
         recenter_epsf=False, normalise_epsf=False,
         residual_smoothing_kernel=None, smoothing_kernel=None)
     with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
@@ -86,6 +134,11 @@ def test_variable_epsf_builder_final_refit_preserves_linked_stars():
     assert_allclose(fitted._data[0].cutout_center_flat[0],
                     fitted._data[0].cutout_center_flat[1])
     assert_allclose(fitted._data[0].flux[0], fitted._data[0].flux[1])
+
+
+def test_variable_epsf_builder_rejects_removed_calibrate_ppe_option():
+    with pytest.raises(TypeError, match='unexpected keyword argument'):
+        VariableEPSFBuilder(calibrate_ppe=('Position',))
 
 
 def test_variable_epsf_model_fwhm_dependency():
@@ -779,10 +832,6 @@ def test_variable_epsf_builder_flux_only_preserves_frozen_terms(monkeypatch):
 
     monkeypatch.setattr(builder, '_fit_residual_coefficients',
                         fail_spatial_fit)
-    monkeypatch.setattr(builder, '_fit_spatial_ppe_model',
-                        lambda fitted_stars: None)
-    monkeypatch.setattr(builder, '_apply_spatial_ppe_corrections',
-                        lambda fitted_stars, ppe_model: fitted_stars)
     monkeypatch.setattr(builder, '_apply_linked_constraints',
                         lambda fitted_stars: fitted_stars)
     monkeypatch.setattr(builder, '_select_residual_stars',

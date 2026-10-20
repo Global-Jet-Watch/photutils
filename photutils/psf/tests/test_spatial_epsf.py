@@ -12,8 +12,7 @@ from numpy.testing import assert_allclose
 
 from photutils.centroids import centroid_com
 from photutils.psf.spatial_epsf import (SpatialEPSFBuilder, SpatialEPSFFitter,
-                                        SpatialEPSFModel,
-                                        SpatialPPEMapModel)
+                                        SpatialEPSFModel)
 from photutils.psf.epsf_stars import EPSFStar, EPSFStars, LinkedEPSFStar
 from photutils.psf.image_models import ImagePSF
 
@@ -256,8 +255,7 @@ def test_spatial_epsf_fitter_uses_model_trust_map():
 def test_spatial_epsf_builder_trust_map_rms_from_residuals():
     builder = SpatialEPSFBuilder(detector_shape=(100, 100), oversampling=1,
                                  degree=0, maxiters=1,
-                                 residual_min_valid_samples=1,
-                                 calibrate_ppe=())
+                                 residual_min_valid_samples=1)
 
     residuals = np.array([
         [[1.0, 2.0], [3.0, np.nan]],
@@ -286,8 +284,7 @@ def test_spatial_epsf_builder_infers_detector_geometry_from_samples():
     ])
 
     builder = SpatialEPSFBuilder(oversampling=1, degree=1, maxiters=1,
-                                 residual_min_valid_samples=1,
-                                 calibrate_ppe=())
+                                 residual_min_valid_samples=1)
 
     builder._resolve_detector_geometry(stars)
 
@@ -429,25 +426,6 @@ def test_spatial_epsf_model_plot_validation_and_trust_map():
         plt.close(fig)
 
 
-def test_spatial_ppe_model_detector_position_and_broadcasting():
-    # A linear flux correction varies with detector x; position corrections
-    # are constant across detector position.
-    flux_coeff = np.zeros((3, 2, 2), dtype=float)
-    flux_coeff[0] = 0.1
-    flux_coeff[1] = 0.1
-    x_coeff = np.zeros_like(flux_coeff)
-    x_coeff[0] = 0.2
-    y_coeff = np.zeros_like(flux_coeff)
-    y_coeff[0] = -0.1
-    model = SpatialPPEMapModel(flux_coeff, x_coeff, y_coeff,
-                               supersampling=(2, 2),
-                               detector_shape=(11, 21), degree=1)
-
-    left = model(10.0, 0.25, 0.25, det_x=0.0, det_y=5.0)
-    right = model(10.0, 0.5, 0.5, det_x=20.0, det_y=5.0)
-
-    assert_allclose(left, (10.0, 0.05, 0.35))
-    assert_allclose(right, (10.0 / 1.2, 0.3, 0.6))
 
 
 def test_spatial_epsf_builder_auto_quadratic_offset_core_size():
@@ -598,7 +576,7 @@ def test_spatial_epsf_builder_runs_one_build_iteration():
                                  fit_boxsize=None),
         smoothing_kernel=None, residual_smoothing_kernel=None,
         residual_min_valid_samples=1, residual_outlier_clip=None,
-        calibrate_ppe=(), constrain_stars=(), recenter_epsf=False,
+        constrain_stars=(), recenter_epsf=False,
         normalise_epsf=False)
 
     with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
@@ -618,7 +596,8 @@ def test_spatial_epsf_builder_runs_one_build_iteration():
     assert_allclose(model.coeff_data, initial_coeff)
 
 
-def test_spatial_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
+def test_spatial_epsf_builder_returns_final_model_fits_without_correction(
+        monkeypatch):
     stars = EPSFStars([EPSFStar(np.ones((5, 5), dtype=float),
                                 cutout_center=(2.0, 2.0)),
                        EPSFStar(np.ones((5, 5), dtype=float),
@@ -629,7 +608,7 @@ def test_spatial_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
                                  fit_boxsize=None),
         smoothing_kernel=None, residual_smoothing_kernel=None,
         residual_min_valid_samples=1, residual_outlier_clip=None,
-        calibrate_ppe=('Position', 'Flux'), constrain_stars=('Position', 'Flux'),
+        constrain_stars=('Position', 'Flux'),
         recenter_epsf=False, normalise_epsf=False)
     seen = []
 
@@ -641,13 +620,7 @@ def test_spatial_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
                            flux=20.0 + len(seen))]
         return EPSFStars(fitted)
 
-    class PPE:
-        def __call__(self, flux, x, y, **kwargs):
-            return flux + 5.0, x + 0.25, y + 0.5
-
     monkeypatch.setattr(builder, 'fitter', fit)
-    monkeypatch.setattr(builder, '_fit_spatial_ppe_model',
-                        lambda fitted: PPE())
     monkeypatch.setattr(builder, '_resample_residuals',
                         lambda *args: (np.zeros((1, 5, 5)),
                                        np.ones((1, 5, 5)),
@@ -667,8 +640,8 @@ def test_spatial_epsf_builder_returns_final_model_fits_and_ppe(monkeypatch):
 
     assert len(seen) == 2
     assert seen[-1] is model
-    assert_allclose(fitted._getattr_flat('flux'), (17.0, 27.0))
-    assert_allclose(fitted.cutout_center_flat, ((2.25, 2.5), (2.25, 2.5)))
+    assert_allclose(fitted._getattr_flat('flux'), (12.0, 22.0))
+    assert_allclose(fitted.cutout_center_flat, ((2.0, 2.0), (2.0, 2.0)))
 
 
 def test_spatial_epsf_builder_final_refit_preserves_linked_stars():
@@ -690,7 +663,7 @@ def test_spatial_epsf_builder_final_refit_preserves_linked_stars():
                                  fit_boxsize=None),
         smoothing_kernel=None, residual_smoothing_kernel=None,
         residual_min_valid_samples=1, residual_outlier_clip=None,
-        calibrate_ppe=(), constrain_stars=('Position', 'Flux'),
+        constrain_stars=('Position', 'Flux'),
         recenter_epsf=False, normalise_epsf=False)
     with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
         _, fitted = builder.build_epsf(stars)
@@ -727,13 +700,6 @@ def test_spatial_epsf_builder_residual_update_fraction_validation():
     assert builder.residual_update_fraction == 0.35
 
 
-def test_spatial_epsf_builder_infers_ppe_settings_from_main_settings():
-    builder = SpatialEPSFBuilder(detector_shape=(100, 100),
-                                 oversampling=(2, 3), degree=2,
-                                 residual_min_valid_samples=7)
-    assert builder.ppe_degree == 2
-    assert_allclose(builder.ppe_supersampling, (2, 3))
-    assert builder.ppe_min_valid_samples == 7
 
 
 def test_spatial_epsf_builder_epsf_class_is_used():
@@ -829,27 +795,18 @@ def test_spatial_epsf_builder_select_residual_stars_excludes_fit_failures():
     assert selected.all_stars[1]._excluded_from_fit
 
 
-def test_spatial_epsf_builder_calibrate_and_constrain_api():
+def test_spatial_epsf_builder_constrain_api():
+    with pytest.raises(TypeError, match='unexpected keyword argument'):
+        SpatialEPSFBuilder(detector_shape=(100, 100),
+                           calibrate_ppe=('Position',))
+
     builder = SpatialEPSFBuilder(detector_shape=(100, 100),
-                                 calibrate_ppe=('Position',),
                                  constrain_stars=('Flux',))
-    assert builder.calibrate_ppe == ('Position',)
     assert builder.constrain_stars == ('Flux',)
 
     constrained = builder._apply_linked_constraints(_ConstraintTracker())
     assert constrained.center_calls == 0
     assert constrained.flux_calls == 1
-
-    builder = SpatialEPSFBuilder(detector_shape=(100, 100),
-                                 calibrate_ppe=(),
-                                 constrain_stars=('Position',))
-    assert builder._fit_spatial_ppe_model(EPSFStars([])).flux_coeff.shape[0] >= 1
-
-    with pytest.raises(ValueError,
-                       match="calibrate_ppe entries must be 'Flux' and/or "
-                             "'Position'"):
-        SpatialEPSFBuilder(detector_shape=(100, 100),
-                           calibrate_ppe=('Flux', 'Bad'))
 
     with pytest.raises(ValueError,
                        match="constrain_stars entries must be 'Flux' and/or "
