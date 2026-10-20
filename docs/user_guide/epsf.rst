@@ -365,7 +365,9 @@ The degree can be 0, 1, or 2. Supplying ``detector_shape`` gives the
 model the detector coordinate range explicitly. To inspect or use the
 local PSF at detector coordinates ``(x, y)``, call
 ``spatial_epsf.make_image_psf(x, y)``. To fit stars with the spatial
-model, use :class:`~photutils.psf.SpatialEPSFFitter`.
+model, use :class:`~photutils.psf.SpatialEPSFFitter`. The returned
+``fitted_stars`` are fitted against the returned final model and include
+the final PPE corrections when calibration is enabled.
 
 
 Variable ePSFs
@@ -387,9 +389,11 @@ Flux-dependent models need stars spanning the flux range of interest.
 FWHM-dependent models likewise need representative FWHM information on
 the input stars. When the input stars are linked across images,
 ``forced_photometry=True`` in the associated fitter holds their
-positions fixed while fitting fluxes. This builder is a prototype; its
-results should be validated for the data and range of conditions where
-the model will be applied.
+positions fixed while fitting fluxes. The returned ``fitted_stars`` are
+fitted against the returned final model and include the final PPE
+corrections when calibration is enabled. This builder is a prototype;
+its results should be validated for the data and range of conditions
+where the model will be applied.
 
 
 Estimating ePSF model error

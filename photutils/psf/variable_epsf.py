@@ -661,6 +661,10 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
     This is an experimental prototype that layers configurable flux- and
     FWHM-dependent corrections onto the spatial model.
 
+    The returned ``fitted_stars`` are fitted against the returned final
+    model. When PPE calibration is enabled, they include PPE corrections
+    computed from those final-model fits.
+
     Parameters
     ----------
     dependencies : iterable of {'Position', 'Flux', 'FWHM'}, optional
@@ -1716,6 +1720,17 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
                 break
 
             stars = fitted_stars
+
+        # Refit against the completed model, and derive final PPE corrections
+        # from these fits rather than from the preceding model update.
+        self._log('VariableEPSFBuilder: fitting stars to final model')
+        fitted_stars_raw = self.variable_fitter(variable_model, stars)
+        spatial_ppe_model = self._fit_spatial_ppe_model(fitted_stars_raw)
+        self._ppe_models.append(spatial_ppe_model)
+        self.final_ppe_model = spatial_ppe_model
+        fitted_stars_corrected = self._apply_spatial_ppe_corrections(
+            fitted_stars_raw, spatial_ppe_model)
+        stars = self._apply_linked_constraints(fitted_stars_corrected)
 
         self._log('VariableEPSFBuilder: finished')
         return variable_model, stars
