@@ -611,6 +611,7 @@ def test_spatial_epsf_builder_returns_final_model_fits_without_correction(
         constrain_stars=('Position', 'Flux'),
         recenter_epsf=False, normalise_epsf=False)
     seen = []
+    constraint_calls = []
 
     def fit(model, input_stars):
         seen.append(model)
@@ -621,6 +622,9 @@ def test_spatial_epsf_builder_returns_final_model_fits_without_correction(
         return EPSFStars(fitted)
 
     monkeypatch.setattr(builder, 'fitter', fit)
+    monkeypatch.setattr(builder, '_apply_linked_constraints',
+                        lambda fitted: (constraint_calls.append(fitted),
+                                        fitted)[1])
     monkeypatch.setattr(builder, '_resample_residuals',
                         lambda *args: (np.zeros((1, 5, 5)),
                                        np.ones((1, 5, 5)),
@@ -639,12 +643,13 @@ def test_spatial_epsf_builder_returns_final_model_fits_without_correction(
     model, fitted = builder.build_epsf(stars)
 
     assert len(seen) == 2
+    assert len(constraint_calls) == 1  # iterative fit only
     assert seen[-1] is model
     assert_allclose(fitted._getattr_flat('flux'), (12.0, 22.0))
     assert_allclose(fitted.cutout_center_flat, ((2.0, 2.0), (2.0, 2.0)))
 
 
-def test_spatial_epsf_builder_final_refit_preserves_linked_stars():
+def test_spatial_epsf_builder_final_refit_keeps_linked_star_groups():
     from astropy.wcs import WCS
 
     wcs = WCS(naxis=2)
@@ -668,9 +673,6 @@ def test_spatial_epsf_builder_final_refit_preserves_linked_stars():
     with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
         _, fitted = builder.build_epsf(stars)
     assert isinstance(fitted._data[0], LinkedEPSFStar)
-    assert_allclose(fitted._data[0].cutout_center_flat[0],
-                    fitted._data[0].cutout_center_flat[1])
-    assert_allclose(fitted._data[0].flux[0], fitted._data[0].flux[1])
 
 
 def test_spatial_epsf_builder_residual_outlier_clip_validation():

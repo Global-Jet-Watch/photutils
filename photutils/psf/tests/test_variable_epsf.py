@@ -76,10 +76,11 @@ def test_variable_epsf_builder_returns_final_model_fits_without_correction(
         dependencies=('Position',), fit_dependencies=('Position',),
         detector_shape=(10, 10), oversampling=2, degree=0, maxiters=1,
         residual_min_valid_samples=1, residual_outlier_clip=None,
-        constrain_stars=(),
+        constrain_stars=('Position', 'Flux'),
         recenter_epsf=False, normalise_epsf=False,
         residual_smoothing_kernel=None, smoothing_kernel=None)
     seen = []
+    constraint_calls = []
 
     def fit(model, input_stars):
         seen.append(model)
@@ -87,6 +88,9 @@ def test_variable_epsf_builder_returns_final_model_fits_without_correction(
                                    flux=10.0 + len(seen))])
 
     monkeypatch.setattr(builder, 'variable_fitter', fit)
+    monkeypatch.setattr(builder, '_apply_linked_constraints',
+                        lambda fitted: (constraint_calls.append(fitted),
+                                        fitted)[1])
     monkeypatch.setattr(builder, '_resample_residuals',
                         lambda *args: (np.zeros((1, 5, 5)),
                                        np.ones((1, 5, 5)),
@@ -105,12 +109,13 @@ def test_variable_epsf_builder_returns_final_model_fits_without_correction(
     model, fitted = builder.build_epsf(stars)
 
     assert len(seen) == 2
+    assert len(constraint_calls) == 1  # iterative fit only
     assert seen[-1] is model
     assert_allclose(fitted[0].flux, 12.0)
     assert_allclose(fitted[0].cutout_center, (2.0, 2.0))
 
 
-def test_variable_epsf_builder_final_refit_preserves_linked_stars():
+def test_variable_epsf_builder_final_refit_keeps_linked_star_groups():
     from astropy.wcs import WCS
 
     wcs = WCS(naxis=2)
@@ -131,9 +136,6 @@ def test_variable_epsf_builder_final_refit_preserves_linked_stars():
     with pytest.warns(AstropyUserWarning, match='Insufficient sources'):
         _, fitted = builder.build_epsf(stars)
     assert isinstance(fitted._data[0], LinkedEPSFStar)
-    assert_allclose(fitted._data[0].cutout_center_flat[0],
-                    fitted._data[0].cutout_center_flat[1])
-    assert_allclose(fitted._data[0].flux[0], fitted._data[0].flux[1])
 
 
 def test_variable_epsf_builder_rejects_removed_calibrate_ppe_option():
