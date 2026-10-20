@@ -661,8 +661,9 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
     This is an experimental prototype that layers configurable flux- and
     FWHM-dependent model terms onto the spatial model.
 
-    The returned ``fitted_stars`` are fitted against the returned final
-    model.
+    Linked-star constraints are applied during iterative model updates.
+    The final fit to the completed model is unconstrained, and the returned
+    ``fitted_stars`` contain those fits.
 
     Parameters
     ----------
@@ -1706,7 +1707,7 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
         # describes the same iteration.
         self._log('VariableEPSFBuilder: fitting stars to final model')
         fitted_stars = self.variable_fitter(variable_model, stars)
-        stars = self._apply_linked_constraints(fitted_stars)
+        stars = fitted_stars
 
         self._log('VariableEPSFBuilder: finished')
         return variable_model, stars

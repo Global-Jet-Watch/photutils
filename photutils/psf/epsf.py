@@ -381,7 +381,9 @@ class EPSFBuilder:
         after each iteration.
 
     constrain_stars : tuple of {'Flux', 'Position'}, optional
-        Which linked-star constraints to apply after each fitting step.
+        Which linked-star constraints to apply during the iterative build,
+        before each ePSF update. The final fit to the completed ePSF is
+        unconstrained.
         Include ``'Flux'`` to constrain linked-star fluxes and
         ``'Position'`` to constrain linked-star positions.
 
@@ -1553,8 +1555,10 @@ class EPSFBuilder:
             The constructed ePSF.
 
         fitted_stars : `EPSFStars` object
-            The input stars with updated centers and fluxes derived
-            from fitting the output ``epsf``.
+            The input stars with updated centers and fluxes from an
+            unconstrained fit to the output ``epsf``. Linked-star
+            constraints are applied during iterative model updates, but
+            not during this final fit.
         """
         iter_num = 0
         fit_failed = np.zeros(stars.n_stars, dtype=bool)
@@ -1738,9 +1742,16 @@ class EPSFBuilder:
                         oversampling=legacy_epsf.oversampling,
                         fill_value=legacy_epsf.fill_value)
 
-        if self.constrain_stars:
-            self.current_epsf = epsf.deepcopy()
-            stars = self._apply_linked_star_constraints(stars,
-                                                        refit_flux=True)
+        # The final pass is a fit to the completed model.  Linked-star
+        # constraints apply during iterations, before each ePSF update.
+        self.current_epsf = epsf.deepcopy()
+        with warnings.catch_warnings():
+            message = '.*The fit may be unsuccessful;.*'
+            warnings.filterwarnings('ignore', message=message,
+                                    category=AstropyUserWarning)
+            image_psf = self.epsf_class(data=epsf.data, origin=epsf.origin,
+                                        oversampling=epsf.oversampling,
+                                        fill_value=epsf.fill_value)
+            stars = self.fitter(image_psf, stars)
 
         return epsf, stars

@@ -829,8 +829,8 @@ class SpatialEPSFBuilder:
 
     Linked stars can optionally be constrained after each fit iteration
     to share a common mean sky position and/or mean flux before the
-    residual stack is formed. The returned ``fitted_stars`` are fitted
-    against the returned final model.
+    residual stack is formed. The final fit to the completed model is
+    unconstrained, and the returned ``fitted_stars`` contain those fits.
 
     If ``detector_shape`` is not provided, then the detector-coordinate
     normalization is inferred from the distribution of the input star
@@ -2667,7 +2667,7 @@ class SpatialEPSFBuilder:
         # describes the same iteration.
         self._log('SpatialEPSFBuilder: fitting stars to final model')
         fitted_stars = self.fitter(spatial_model, stars)
-        stars = self._apply_linked_constraints(fitted_stars)
+        stars = fitted_stars
 
         self._log('SpatialEPSFBuilder: finished')
 
