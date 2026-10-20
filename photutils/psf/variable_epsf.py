@@ -659,11 +659,10 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
     Notes
     -----
     This is an experimental prototype that layers configurable flux- and
-    FWHM-dependent corrections onto the spatial model.
+    FWHM-dependent model terms onto the spatial model.
 
     The returned ``fitted_stars`` are fitted against the returned final
-    model. When PPE calibration is enabled, they include PPE corrections
-    computed from those final-model fits.
+    model.
 
     Parameters
     ----------
@@ -1441,8 +1440,6 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
             raise TypeError('stars must be an EPSFStars object')
 
         self._models = []
-        self._ppe_models = []
-        self.final_ppe_model = None
         self._warned_missing_exptime = False
         self._warned_missing_fwhm = False
         self._warned_missing_saturation_exptime = False
@@ -1454,8 +1451,6 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
         if self.plot_diagnostics:
             self._log('VariableEPSFBuilder: plotting sample distribution')
             self.plot_sample_distribution(stars, linked_only=True)
-            self._log('VariableEPSFBuilder: plotting sub-pixel distribution')
-            self.plot_subpixel_distribution(stars)
         variable_model = self._create_initial_variable_model(
             stars, init_model=init_model)
         lock_flux_mapping = (self.reuse_init_flux_mapping
@@ -1483,21 +1478,9 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
                       f'ok={n_ok}, overlap={n_overlap}, '
                       f'fit_error={n_fit_error}')
 
-            self._log(f'VariableEPSFBuilder: iteration {iter_num} fitting '
-                      'spatial PPE correction surfaces')
-            spatial_ppe_model = self._fit_spatial_ppe_model(fitted_stars_raw)
-            self._ppe_models.append(spatial_ppe_model)
-
             self._log(f'VariableEPSFBuilder: iteration {iter_num} applying '
-                      'spatial PPE corrections to fitted stars')
-            fitted_stars_corrected = self._apply_spatial_ppe_corrections(
-                fitted_stars_raw, spatial_ppe_model)
-            self.final_ppe_model = spatial_ppe_model
-
-            self._log(f'VariableEPSFBuilder: iteration {iter_num} applying '
-                      'linked-star constraints to PPE-corrected values')
-            fitted_stars = self._apply_linked_constraints(
-                fitted_stars_corrected)
+                      'linked-star constraints')
+            fitted_stars = self._apply_linked_constraints(fitted_stars_raw)
 
             self._log(f'VariableEPSFBuilder: iteration {iter_num} selecting '
                       'stars for residual stack')
@@ -1535,8 +1518,6 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
                 self._log(f'VariableEPSFBuilder: iteration {iter_num} '
                           'plotting diagnostics')
                 self._plot_iteration_diagnostics(variable_model, coeff_update,
-                                                fitted_stars_raw,
-                                                fitted_stars_corrected,
                                                 det_x, det_y, iter_num)
                 self._plot_central_residual_fit(residuals, det_x, det_y,
                                                 group_id, x_coords, y_coords,
@@ -1721,16 +1702,11 @@ class VariableEPSFBuilder(SpatialEPSFBuilder):
 
             stars = fitted_stars
 
-        # Refit against the completed model, and derive final PPE corrections
-        # from these fits rather than from the preceding model update.
+        # Refit against the completed model so the returned model/star pair
+        # describes the same iteration.
         self._log('VariableEPSFBuilder: fitting stars to final model')
-        fitted_stars_raw = self.variable_fitter(variable_model, stars)
-        spatial_ppe_model = self._fit_spatial_ppe_model(fitted_stars_raw)
-        self._ppe_models.append(spatial_ppe_model)
-        self.final_ppe_model = spatial_ppe_model
-        fitted_stars_corrected = self._apply_spatial_ppe_corrections(
-            fitted_stars_raw, spatial_ppe_model)
-        stars = self._apply_linked_constraints(fitted_stars_corrected)
+        fitted_stars = self.variable_fitter(variable_model, stars)
+        stars = self._apply_linked_constraints(fitted_stars)
 
         self._log('VariableEPSFBuilder: finished')
         return variable_model, stars

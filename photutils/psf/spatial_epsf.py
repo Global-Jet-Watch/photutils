@@ -32,8 +32,7 @@ from photutils.utils._round import py2intround
 from photutils.utils._stats import nanmedian
 from photutils.utils.cutouts import _overlap_slices as overlap_slices
 
-__all__ = ['SpatialEPSFModel', 'SpatialPPEMapModel', 'SpatialEPSFFitter',
-           'SpatialEPSFBuilder', 'PPEMap']
+__all__ = ['SpatialEPSFModel', 'SpatialEPSFFitter', 'SpatialEPSFBuilder']
 
 
 class SpatialEPSFModel:
@@ -418,76 +417,6 @@ class SpatialEPSFModel:
         return copy.deepcopy(self)
 
 
-class SpatialPPEMapModel:
-    """
-    Detector-position-dependent PPE correction model.
-
-    Each phase-bin value in the flux/x/y PPE maps is represented as a
-    low-order polynomial in detector position.
-    """
-
-    def __init__(self, flux_coeff, x_coeff, y_coeff, *, supersampling,
-                 detector_shape, degree=1, detector_origin=None,
-                 detector_span=None):
-        self.flux_coeff = np.asanyarray(flux_coeff, dtype=float)
-        self.x_coeff = np.asanyarray(x_coeff, dtype=float)
-        self.y_coeff = np.asanyarray(y_coeff, dtype=float)
-        self.supersampling = as_pair('supersampling', supersampling,
-                                     lower_bound=(1, 1))
-        self.detector_shape = as_pair('detector_shape', detector_shape,
-                                      lower_bound=(2, 2))
-        if detector_origin is None:
-            detector_origin = (0.0, 0.0)
-        self.detector_origin = np.asanyarray(detector_origin, dtype=float)
-        if self.detector_origin.shape != (2,):
-            raise ValueError('detector_origin must have shape (2,)')
-        if not np.all(np.isfinite(self.detector_origin)):
-            raise ValueError('detector_origin must contain only finite values')
-        if detector_span is None:
-            detector_span = self.detector_shape - 1
-        self.detector_span = np.asanyarray(detector_span, dtype=float)
-        if self.detector_span.shape != (2,):
-            raise ValueError('detector_span must have shape (2,)')
-        if not np.all(np.isfinite(self.detector_span)):
-            raise ValueError('detector_span must contain only finite values')
-        self.degree = int(degree)
-        if self.degree not in (0, 1, 2):
-            raise ValueError('degree must be 0, 1, or 2')
-
-        expected_basis = len(SpatialEPSFModel._basis_labels_for_degree(
-            self.degree))
-        for coeff in (self.flux_coeff, self.x_coeff, self.y_coeff):
-            if coeff.ndim != 3:
-                raise ValueError('PPE coefficient arrays must be 3D')
-            if coeff.shape[0] != expected_basis:
-                raise ValueError('PPE coefficient array first axis does not '
-                                 'match degree')
-            if tuple(coeff.shape[1:]) != tuple(self.supersampling):
-                raise ValueError('PPE coefficient grid shape does not match '
-                                 'supersampling')
-
-    def basis_vector(self, x, y):
-        dummy = SpatialEPSFModel(np.zeros((len(
-            SpatialEPSFModel._basis_labels_for_degree(self.degree)), 3, 3)),
-            oversampling=(1, 1), detector_shape=self.detector_shape,
-            degree=self.degree, detector_origin=self.detector_origin,
-            detector_span=self.detector_span)
-        return dummy.basis_vector(x, y)
-
-    def local_maps(self, x, y):
-        basis = self.basis_vector(x, y)
-        flux_map = np.tensordot(basis, self.flux_coeff, axes=(0, 0))
-        x_map = np.tensordot(basis, self.x_coeff, axes=(0, 0))
-        y_map = np.tensordot(basis, self.y_coeff, axes=(0, 0))
-        return PPEMap(self.supersampling, flux_map, x_map, y_map)
-
-    def __call__(self, flux, x, y, *, det_x=None, det_y=None):
-        if det_x is None:
-            det_x = x
-        if det_y is None:
-            det_y = y
-        local_map = self.local_maps(det_x, det_y)
-        return local_map(flux, x, y)
 
 
 class SpatialEPSFFitter:
@@ -901,8 +830,7 @@ class SpatialEPSFBuilder:
     Linked stars can optionally be constrained after each fit iteration
     to share a common mean sky position and/or mean flux before the
     residual stack is formed. The returned ``fitted_stars`` are fitted
-    against the returned final model; when PPE calibration is enabled,
-    they include PPE corrections computed from that final-model fit.
+    against the returned final model.
 
     If ``detector_shape`` is not provided, then the detector-coordinate
     normalization is inferred from the distribution of the input star
@@ -924,7 +852,6 @@ class SpatialEPSFBuilder:
                  recenter_epsf=True,
                  normalise_epsf=True,
                  enforce_nonnegative=False,
-                 calibrate_ppe=('Flux', 'Position'),
                  constrain_stars=('Flux', 'Position'),
                  residual_star_rms_clip=None,
                  residual_outlier_clip=3.0,
@@ -993,21 +920,6 @@ class SpatialEPSFBuilder:
             raise ValueError("coefficient_interpolation_method must be "
                              "'cubic' or 'nearest'")
 
-        if isinstance(calibrate_ppe, str):
-            calibrate_ppe = (calibrate_ppe,)
-        try:
-            calibrate_ppe = tuple(calibrate_ppe)
-        except TypeError as exc:
-            raise TypeError('calibrate_ppe must be an iterable containing '
-                            "'Flux' and/or 'Position'") from exc
-
-        allowed_ppe = {'Flux', 'Position'}
-        invalid_ppe = [item for item in calibrate_ppe if item not in allowed_ppe]
-        if invalid_ppe:
-            raise ValueError("calibrate_ppe entries must be 'Flux' and/or "
-                             "'Position'")
-        self.calibrate_ppe = tuple(dict.fromkeys(calibrate_ppe))
-
         if isinstance(constrain_stars, str):
             constrain_stars = (constrain_stars,)
         try:
@@ -1032,10 +944,6 @@ class SpatialEPSFBuilder:
             raise ValueError('residual_star_rms_clip must be positive or None')
         self.residual_star_rms_clip = residual_star_rms_clip
 
-        self.ppe_degree = self.degree
-        self.ppe_supersampling = self.oversampling
-        self.ppe_min_valid_samples = self.residual_min_valid_samples
-
         if (residual_outlier_clip is not None
                 and residual_outlier_clip <= 0):
             raise ValueError('residual_outlier_clip must be positive or None')
@@ -1050,8 +958,6 @@ class SpatialEPSFBuilder:
             residual_smoothing_kernel)
 
         self._models = []
-        self._ppe_models = []
-        self.final_ppe_model = None
 
     def _set_detector_geometry(self, detector_shape, detector_origin,
                                detector_span):
@@ -1230,17 +1136,6 @@ class SpatialEPSFBuilder:
             constrained.constrain_linked_fluxes()
         return constrained
 
-    def _make_empty_ppe_model(self):
-        nbasis = len(SpatialEPSFModel._basis_labels_for_degree(
-            self.ppe_degree))
-        shape = (nbasis, self.ppe_supersampling[0], self.ppe_supersampling[1])
-        zeros = np.zeros(shape, dtype=float)
-        return SpatialPPEMapModel(zeros, zeros.copy(), zeros.copy(),
-                                  supersampling=self.ppe_supersampling,
-                                  detector_shape=self.detector_shape,
-                                  degree=self.ppe_degree,
-                                  detector_origin=self.detector_origin,
-                                  detector_span=self.detector_span)
 
     @staticmethod
     def _make_smoothing_kernel(kernel):
@@ -2099,49 +1994,6 @@ class SpatialEPSFBuilder:
             coeff_data = coeff_data / scale
         return coeff_data
 
-    def _collect_ppe_residual_results(self, stars):
-        """
-        Collect linked-star residual samples for PPE diagnostics.
-        """
-        residual_results = {'subpixel_x': [], 'subpixel_y': [],
-                            'x_residual': [], 'y_residual': [],
-                            'flux_residual': [], 'det_x': [], 'det_y': []}
-
-        for linked_star in stars:
-            if not isinstance(linked_star, LinkedEPSFStar):
-                continue
-
-            mean_flux = linked_star.get_mean_flux()
-            mean_radec = linked_star.get_mean_radec()
-            if mean_flux is None or mean_radec is None:
-                continue
-            mean_ra, mean_dec = mean_radec
-            if not np.isfinite(mean_flux):
-                continue
-
-            for star in linked_star.all_good_stars:
-                if star.wcs_large is None:
-                    continue
-                mean_x, mean_y = star.wcs_large.world_to_pixel_values(
-                    mean_ra, mean_dec)
-                if not (np.isfinite(mean_x) and np.isfinite(mean_y)):
-                    continue
-
-                residual_results['subpixel_x'].append(np.mod(star.center[0],
-                                                             1.0))
-                residual_results['subpixel_y'].append(np.mod(star.center[1],
-                                                             1.0))
-                residual_results['x_residual'].append(star.center[0] - mean_x)
-                residual_results['y_residual'].append(star.center[1] - mean_y)
-                residual_results['det_x'].append(star.center[0])
-                residual_results['det_y'].append(star.center[1])
-                if mean_flux == 0.0:
-                    residual_results['flux_residual'].append(0.0)
-                else:
-                    residual_results['flux_residual'].append(
-                        (star.flux - mean_flux) / mean_flux)
-
-        return residual_results
 
     def _collect_detector_position_results(self, stars, *, linked_only=False):
         """
@@ -2339,288 +2191,15 @@ class SpatialEPSFBuilder:
         plt.show()
         return fig, axes
 
-    def plot_subpixel_distribution(self, stars, *, bins=None):
-        """
-        Plot the sub-pixel sampling distribution of the input stars.
 
-        This shows:
-        1. the overall detector sub-pixel phases,
-        2. the sub-pixel shifts within each linked star relative to that
-           linked star's reference phase,
-        3. the number of linked stars contributing to each sub-pixel
-           grid cell.
 
-        Parameters
-        ----------
-        stars : `EPSFStars`
-            The input stars container.
 
-        bins : int or tuple of int, optional
-            Number of sub-pixel bins in ``(y, x)`` order. If `None`, then
-            ``self.ppe_supersampling`` is used.
 
-        Returns
-        -------
-        fig, axes : tuple
-            The matplotlib figure and axes array.
-        """
-        import matplotlib.pyplot as plt
-
-        if bins is None:
-            bins = self.ppe_supersampling
-        bins = as_pair('bins', bins, lower_bound=(1, 1))
-
-        overall_x = []
-        overall_y = []
-        shift_x = []
-        shift_y = []
-        overall_group_id = []
-        next_group_id = 0
-
-        for item in stars:
-            if isinstance(item, LinkedEPSFStar):
-                good_stars = item.all_good_stars
-                if len(good_stars) == 0:
-                    continue
-
-                ref_x = np.mod(good_stars[0].center[0], 1.0)
-                ref_y = np.mod(good_stars[0].center[1], 1.0)
-
-                for star in good_stars:
-                    phase_x = np.mod(star.center[0], 1.0)
-                    phase_y = np.mod(star.center[1], 1.0)
-                    overall_x.append(phase_x)
-                    overall_y.append(phase_y)
-                    overall_group_id.append(next_group_id)
-                    shift_x.append(np.mod(phase_x - ref_x, 1.0))
-                    shift_y.append(np.mod(phase_y - ref_y, 1.0))
-                next_group_id += 1
-                continue
-
-            if item._excluded_from_fit:
-                continue
-            overall_x.append(np.mod(item.center[0], 1.0))
-            overall_y.append(np.mod(item.center[1], 1.0))
-            overall_group_id.append(next_group_id)
-            next_group_id += 1
-
-        overall_x = np.asarray(overall_x, dtype=float)
-        overall_y = np.asarray(overall_y, dtype=float)
-        shift_x = np.asarray(shift_x, dtype=float)
-        shift_y = np.asarray(shift_y, dtype=float)
-        overall_group_id = np.asarray(overall_group_id, dtype=int)
-
-        if overall_x.size == 0 or overall_y.size == 0:
-            raise ValueError('No valid sub-pixel samples were found')
-
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4.8),
-                                 constrained_layout=True)
-
-        axes[0].scatter(overall_x, overall_y, s=10, alpha=0.6,
-                        color='tab:blue')
-        axes[0].set_title('Overall Sub-pixel Distribution')
-        axes[0].set_xlabel('Sub-pixel x phase')
-        axes[0].set_ylabel('Sub-pixel y phase')
-        axes[0].set_xlim(0.0, 1.0)
-        axes[0].set_ylim(0.0, 1.0)
-        axes[0].set_aspect('equal', adjustable='box')
-
-        if shift_x.size > 0 and shift_y.size > 0:
-            axes[1].scatter(shift_x, shift_y, s=10, alpha=0.6,
-                            color='tab:green')
-        axes[1].set_title('Relative Sub-pixel Shifts')
-        axes[1].set_xlabel('Shift x phase')
-        axes[1].set_ylabel('Shift y phase')
-        axes[1].set_xlim(0.0, 1.0)
-        axes[1].set_ylim(0.0, 1.0)
-        axes[1].set_aspect('equal', adjustable='box')
-
-        unique_group_counts = np.zeros((bins[0], bins[1]), dtype=int)
-        xbin = np.floor(overall_x * bins[1]).astype(int)
-        ybin = np.floor(overall_y * bins[0]).astype(int)
-        xbin = np.clip(xbin, 0, bins[1] - 1)
-        ybin = np.clip(ybin, 0, bins[0] - 1)
-        for j in range(bins[0]):
-            for i in range(bins[1]):
-                mask = (xbin == i) & (ybin == j)
-                if np.any(mask):
-                    unique_group_counts[j, i] = len(
-                        np.unique(overall_group_id[mask]))
-
-        im = axes[2].imshow(unique_group_counts, origin='lower',
-                            extent=(0.0, 1.0, 0.0, 1.0),
-                            cmap='magma', aspect='equal')
-        axes[2].set_title('Linked Stars per Sub-pixel Cell')
-        axes[2].set_xlabel('Sub-pixel x phase')
-        axes[2].set_ylabel('Sub-pixel y phase')
-        axes[2].set_aspect('equal', adjustable='box')
-        fig.colorbar(im, ax=axes[2], label='Linked stars per cell')
-
-        plt.show()
-        return fig, axes
-
-    def _generate_ppe_map(self, stars, supersampling=None):
-        """
-        Generate a global PPE map from fitted linked stars.
-        """
-        if supersampling is None:
-            supersampling = self.oversampling
-        supersampling = as_pair('supersampling', supersampling,
-                                lower_bound=(1, 1))
-
-        ppe_flux_map = np.full((supersampling[0], supersampling[1]), np.nan)
-        ppe_x_map = np.full((supersampling[0], supersampling[1]), np.nan)
-        ppe_y_map = np.full((supersampling[0], supersampling[1]), np.nan)
-
-        residual_results = self._collect_ppe_residual_results(stars)
-        if len(residual_results['subpixel_x']) == 0:
-            return PPEMap(supersampling, np.zeros_like(ppe_flux_map),
-                          np.zeros_like(ppe_x_map),
-                          np.zeros_like(ppe_y_map))
-
-        subpixel_x = np.asarray(residual_results['subpixel_x'])
-        subpixel_y = np.asarray(residual_results['subpixel_y'])
-        flux_residual = np.asarray(residual_results['flux_residual'])
-        x_residual = np.asarray(residual_results['x_residual'])
-        y_residual = np.asarray(residual_results['y_residual'])
-
-        xbin = np.floor(subpixel_x * supersampling[1]).astype(int)
-        ybin = np.floor(subpixel_y * supersampling[0]).astype(int)
-        xbin = np.clip(xbin, 0, supersampling[1] - 1)
-        ybin = np.clip(ybin, 0, supersampling[0] - 1)
-
-        for j in range(supersampling[0]):
-            for i in range(supersampling[1]):
-                mask = (xbin == i) & (ybin == j)
-                if not np.any(mask):
-                    continue
-                ppe_flux_map[j, i] = np.nanmedian(flux_residual[mask])
-                ppe_x_map[j, i] = np.nanmedian(x_residual[mask])
-                ppe_y_map[j, i] = np.nanmedian(y_residual[mask])
-
-        for ppe_map, fill_value in ((ppe_flux_map, 0.0), (ppe_x_map, 0.0),
-                                    (ppe_y_map, 0.0)):
-            mask = ~np.isfinite(ppe_map)
-            if not np.any(mask):
-                continue
-            if np.all(mask):
-                ppe_map[:] = fill_value
-                continue
-            ppe_map[:] = _interpolate_missing_data(ppe_map, mask=mask,
-                                                   method='nearest')
-            ppe_map[~np.isfinite(ppe_map)] = fill_value
-
-        return PPEMap(supersampling, ppe_flux_map, ppe_x_map, ppe_y_map)
-
-    def _fit_ppe_coefficients(self, values, subpixel_x, subpixel_y, det_x,
-                              det_y):
-        nbasis = len(SpatialEPSFModel._basis_labels_for_degree(
-            self.ppe_degree))
-        coeff_data = np.zeros((nbasis, self.ppe_supersampling[0],
-                               self.ppe_supersampling[1]), dtype=float)
-        basis = SpatialEPSFModel(np.zeros((nbasis, 3, 3)),
-                                 oversampling=(1, 1),
-                                 detector_shape=self.detector_shape,
-                                 degree=self.ppe_degree,
-                                 detector_origin=self.detector_origin,
-                                 detector_span=self.detector_span,
-                                 epsf_class=self.epsf_class).basis_vector(
-                                     det_x, det_y)
-
-        xbin = np.floor(subpixel_x * self.ppe_supersampling[1]).astype(int)
-        ybin = np.floor(subpixel_y * self.ppe_supersampling[0]).astype(int)
-        xbin = np.clip(xbin, 0, self.ppe_supersampling[1] - 1)
-        ybin = np.clip(ybin, 0, self.ppe_supersampling[0] - 1)
-
-        for j in range(self.ppe_supersampling[0]):
-            for i in range(self.ppe_supersampling[1]):
-                mask = ((xbin == i) & (ybin == j)
-                        & np.isfinite(values))
-                if np.count_nonzero(mask) < self.ppe_min_valid_samples:
-                    continue
-
-                z_valid = values[mask]
-                design = basis[:, mask].T
-                if self._sigma_clip is not None:
-                    clipped = self._sigma_clip(z_valid, axis=0, masked=True,
-                                               return_bounds=False)
-                    keep = ~clipped.mask
-                    z_fit = clipped.data[keep]
-                    design = design[keep]
-                else:
-                    z_fit = z_valid
-                if z_fit.size < self.ppe_min_valid_samples:
-                    continue
-
-                coeffs, _, _, _ = np.linalg.lstsq(design, z_fit, rcond=None)
-                coeff_data[:, j, i] = coeffs
-
-        return coeff_data
-
-    def _fit_spatial_ppe_model(self, stars):
-        """
-        Fit detector-position-dependent PPE maps from raw fitted stars.
-        """
-        if len(self.calibrate_ppe) == 0:
-            return self._make_empty_ppe_model()
-
-        residual_results = self._collect_ppe_residual_results(stars)
-        if len(residual_results['subpixel_x']) == 0:
-            return self._make_empty_ppe_model()
-
-        subpixel_x = np.asarray(residual_results['subpixel_x'], dtype=float)
-        subpixel_y = np.asarray(residual_results['subpixel_y'], dtype=float)
-        det_x = np.asarray(residual_results['det_x'], dtype=float)
-        det_y = np.asarray(residual_results['det_y'], dtype=float)
-
-        flux_coeff = self._fit_ppe_coefficients(
-            np.asarray(residual_results['flux_residual'], dtype=float),
-            subpixel_x, subpixel_y, det_x, det_y)
-        x_coeff = self._fit_ppe_coefficients(
-            np.asarray(residual_results['x_residual'], dtype=float),
-            subpixel_x, subpixel_y, det_x, det_y)
-        y_coeff = self._fit_ppe_coefficients(
-            np.asarray(residual_results['y_residual'], dtype=float),
-            subpixel_x, subpixel_y, det_x, det_y)
-
-        return SpatialPPEMapModel(flux_coeff, x_coeff, y_coeff,
-                                  supersampling=self.ppe_supersampling,
-                                  detector_shape=self.detector_shape,
-                                  degree=self.ppe_degree,
-                                  detector_origin=self.detector_origin,
-                                  detector_span=self.detector_span)
-
-    def _apply_spatial_ppe_corrections(self, stars, spatial_ppe_model):
-        """
-        Apply spatially varying PPE corrections to fitted stars.
-        """
-        apply_flux = 'Flux' in self.calibrate_ppe
-        apply_position = 'Position' in self.calibrate_ppe
-        if not apply_flux and not apply_position:
-            return copy.deepcopy(stars)
-
-        corrected = copy.deepcopy(stars)
-        for star in corrected.all_stars:
-            corrected_flux, corrected_x, corrected_y = spatial_ppe_model(
-                star.flux, star.center[0], star.center[1],
-                det_x=star.center[0], det_y=star.center[1])
-            if apply_flux:
-                star.flux = corrected_flux
-            if apply_position:
-                star.cutout_center = np.array((corrected_x, corrected_y),
-                                              dtype=float) - star.origin
-
-        return corrected
 
     def _plot_iteration_diagnostics(self, spatial_model, coeff_update,
-                                    ppe_stars_before, ppe_stars_after,
                                     det_x, det_y, iter_num):
         """
-        Plot three diagnostic figures:
-        1. local ePSF models across a 3x3 grid spanning the sampled
-           detector region,
-        2. local residual-update images across the same 3x3 grid,
-        3. overall PPE maps before and after the spatial PPE correction.
+        Plot local ePSF models and residual updates across the detector.
         """
         if not self.plot_diagnostics:
             return
@@ -2683,69 +2262,6 @@ class SpatialEPSFBuilder:
             fig_resid.colorbar(im, ax=ax)
         fig_resid.suptitle(f'Iteration {iter_num}: Residual Updates',
                            fontsize=14)
-
-        sample_factor = 3
-        extent = (0.0, 1.0, 0.0, 1.0)
-
-        def _sample_ppe_maps(stars):
-            ppe_map = self._generate_ppe_map(stars)
-            yphase = np.linspace(0.0, 1.0,
-                                 ppe_map.supersampling[0] * sample_factor,
-                                 endpoint=False)
-            xphase = np.linspace(0.0, 1.0,
-                                 ppe_map.supersampling[1] * sample_factor,
-                                 endpoint=False)
-            xx, yy = np.meshgrid(xphase, yphase)
-            return (
-                ppe_map._sample_periodic_map(ppe_map.flux_ppe, xx, yy,
-                                             ppe_map.supersampling),
-                ppe_map._sample_periodic_map(ppe_map.x_ppe, xx, yy,
-                                             ppe_map.supersampling),
-                ppe_map._sample_periodic_map(ppe_map.y_ppe, xx, yy,
-                                             ppe_map.supersampling),
-            )
-
-        ppe_before = _sample_ppe_maps(ppe_stars_before)
-        ppe_after = _sample_ppe_maps(ppe_stars_after)
-        titles = (
-            ('Flux PPE Before', 'Flux PPE After',
-             'Fractional flux residual'),
-            ('X PPE Before', 'X PPE After', 'X residual (pixels)'),
-            ('Y PPE Before', 'Y PPE After', 'Y residual (pixels)'),
-        )
-
-        fig_ppe, axes_ppe = plt.subplots(2, 3, figsize=(14, 8),
-                                         constrained_layout=True)
-        for col, ((before_data, after_data), (before_title, after_title,
-                                               cbar_label)) in enumerate(
-                                                   zip(zip(ppe_before,
-                                                           ppe_after),
-                                                       titles),
-                                                   start=0):
-            im_before = axes_ppe[0, col].imshow(before_data, origin='lower',
-                                                extent=extent,
-                                                cmap='coolwarm',
-                                                aspect='equal')
-            axes_ppe[0, col].set_title(
-                f'Iteration {iter_num}: {before_title}')
-            axes_ppe[0, col].set_xlabel('Subpixel x phase')
-            axes_ppe[0, col].set_ylabel('Subpixel y phase')
-            fig_ppe.colorbar(im_before, ax=axes_ppe[0, col],
-                             label=cbar_label)
-
-            im_after = axes_ppe[1, col].imshow(after_data, origin='lower',
-                                               extent=extent,
-                                               cmap='coolwarm',
-                                               aspect='equal')
-            axes_ppe[1, col].set_title(
-                f'Iteration {iter_num}: {after_title}')
-            axes_ppe[1, col].set_xlabel('Subpixel x phase')
-            axes_ppe[1, col].set_ylabel('Subpixel y phase')
-            fig_ppe.colorbar(im_after, ax=axes_ppe[1, col],
-                             label=cbar_label)
-
-        fig_ppe.suptitle(f'Iteration {iter_num}: PPE Diagnostics',
-                         fontsize=14)
 
         plt.show()
 
@@ -3009,15 +2525,11 @@ class SpatialEPSFBuilder:
             raise TypeError('stars must be an EPSFStars object')
 
         self._models = []
-        self._ppe_models = []
-        self.final_ppe_model = None
         self._resolve_detector_geometry(stars, init_model=init_model)
         self._log('SpatialEPSFBuilder: creating initial spatial model')
         if self.plot_diagnostics:
             self._log('SpatialEPSFBuilder: plotting sample distribution')
             self.plot_sample_distribution(stars, linked_only=True)
-            self._log('SpatialEPSFBuilder: plotting sub-pixel distribution')
-            self.plot_subpixel_distribution(stars)
         spatial_model = (self._create_initial_model(stars)
                          if init_model is None else init_model.deepcopy())
         centers = stars.cutout_center_flat
@@ -3038,21 +2550,9 @@ class SpatialEPSFBuilder:
                       f'ok={n_ok}, overlap={n_overlap}, '
                       f'fit_error={n_fit_error}')
 
-            self._log(f'SpatialEPSFBuilder: iteration {iter_num} fitting '
-                      'spatial PPE correction surfaces')
-            spatial_ppe_model = self._fit_spatial_ppe_model(fitted_stars_raw)
-            self._ppe_models.append(spatial_ppe_model)
-
             self._log(f'SpatialEPSFBuilder: iteration {iter_num} applying '
-                      'spatial PPE corrections to fitted stars')
-            fitted_stars_corrected = self._apply_spatial_ppe_corrections(
-                fitted_stars_raw, spatial_ppe_model)
-            self.final_ppe_model = spatial_ppe_model
-
-            self._log(f'SpatialEPSFBuilder: iteration {iter_num} applying '
-                      'linked-star constraints to PPE-corrected values')
-            fitted_stars = self._apply_linked_constraints(
-                fitted_stars_corrected)
+                      'linked-star constraints')
+            fitted_stars = self._apply_linked_constraints(fitted_stars_raw)
 
             self._log(f'SpatialEPSFBuilder: iteration {iter_num} selecting '
                       'stars for residual stack')
@@ -3104,8 +2604,6 @@ class SpatialEPSFBuilder:
                 self._log(f'SpatialEPSFBuilder: iteration {iter_num} plotting '
                         'diagnostics')
                 self._plot_iteration_diagnostics(spatial_model, coeff_update,
-                                                fitted_stars_raw,
-                                                fitted_stars_corrected,
                                                 det_x, det_y, iter_num)
                 self._plot_central_residual_fit(residuals, det_x, det_y,
                                                 group_id, x_coords, y_coords,
@@ -3166,118 +2664,11 @@ class SpatialEPSFBuilder:
             stars = fitted_stars
 
         # Refit against the completed model so the returned model/star pair
-        # describes the same iteration. Recompute PPE from these raw fits.
+        # describes the same iteration.
         self._log('SpatialEPSFBuilder: fitting stars to final model')
-        fitted_stars_raw = self.fitter(spatial_model, stars)
-        spatial_ppe_model = self._fit_spatial_ppe_model(fitted_stars_raw)
-        self._ppe_models.append(spatial_ppe_model)
-        self.final_ppe_model = spatial_ppe_model
-        fitted_stars_corrected = self._apply_spatial_ppe_corrections(
-            fitted_stars_raw, spatial_ppe_model)
-        stars = self._apply_linked_constraints(fitted_stars_corrected)
+        fitted_stars = self.fitter(spatial_model, stars)
+        stars = self._apply_linked_constraints(fitted_stars)
 
         self._log('SpatialEPSFBuilder: finished')
 
         return spatial_model, stars
-
-
-class PPEMap:
-    """
-    Simple PPE correction map.
-
-    This mirrors the interface used in ``epsf.py`` so the new module can
-    still be used for PPE diagnostics if desired.
-    """
-
-    def __init__(self, supersampling, flux_ppe, x_ppe, y_ppe):
-        self.supersampling = supersampling
-        self.flux_ppe = flux_ppe
-        self.x_ppe = x_ppe
-        self.y_ppe = y_ppe
-
-    @staticmethod
-    def _sample_periodic_map(ppe_map, x, y, supersampling):
-        xphase = np.mod(x, 1.0)
-        yphase = np.mod(y, 1.0)
-        xcoord = xphase * supersampling[1] - 0.5
-        ycoord = yphase * supersampling[0] - 0.5
-        x0 = np.floor(xcoord).astype(int)
-        y0 = np.floor(ycoord).astype(int)
-        dx = xcoord - x0
-        dy = ycoord - y0
-        x0 %= supersampling[1]
-        y0 %= supersampling[0]
-        x1 = (x0 + 1) % supersampling[1]
-        y1 = (y0 + 1) % supersampling[0]
-
-        return ((1.0 - dx) * (1.0 - dy) * ppe_map[y0, x0]
-                + dx * (1.0 - dy) * ppe_map[y0, x1]
-                + (1.0 - dx) * dy * ppe_map[y1, x0]
-                + dx * dy * ppe_map[y1, x1])
-
-    def __call__(self, flux, x, y):
-        flux_scalar = np.isscalar(flux)
-        x_scalar = np.isscalar(x)
-        y_scalar = np.isscalar(y)
-
-        flux, x, y = np.broadcast_arrays(np.asanyarray(flux, dtype=float),
-                                         np.asanyarray(x, dtype=float),
-                                         np.asanyarray(y, dtype=float))
-
-        flux_residual = self._sample_periodic_map(self.flux_ppe, x, y,
-                                                  self.supersampling)
-        x_residual = self._sample_periodic_map(self.x_ppe, x, y,
-                                               self.supersampling)
-        y_residual = self._sample_periodic_map(self.y_ppe, x, y,
-                                               self.supersampling)
-
-        flux_scale = 1.0 + flux_residual
-        invalid = (~np.isfinite(flux_scale)) | (flux_scale == 0.0)
-        corrected_flux = np.array(flux, copy=True)
-        np.divide(flux, flux_scale, out=corrected_flux, where=~invalid)
-        corrected_x = x - np.where(np.isfinite(x_residual), x_residual, 0.0)
-        corrected_y = y - np.where(np.isfinite(y_residual), y_residual, 0.0)
-
-        if flux_scalar and x_scalar and y_scalar:
-            return (corrected_flux.item(), corrected_x.item(),
-                    corrected_y.item())
-        return corrected_flux, corrected_x, corrected_y
-
-    def plot_maps(self):
-        """
-        Plot the PPE maps for visual inspection.
-        """
-        import matplotlib.pyplot as plt
-
-        sample_factor = 3
-        yphase = np.linspace(0.0, 1.0, self.supersampling[0] * sample_factor,
-                             endpoint=False)
-        xphase = np.linspace(0.0, 1.0, self.supersampling[1] * sample_factor,
-                             endpoint=False)
-        xx, yy = np.meshgrid(xphase, yphase)
-
-        flux_map = self._sample_periodic_map(self.flux_ppe, xx, yy,
-                                             self.supersampling)
-        x_map = self._sample_periodic_map(self.x_ppe, xx, yy,
-                                          self.supersampling)
-        y_map = self._sample_periodic_map(self.y_ppe, xx, yy,
-                                          self.supersampling)
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5),
-                                 constrained_layout=True)
-        map_data = (
-            (flux_map, 'Flux PPE', 'Fractional flux residual'),
-            (x_map, 'X PPE', 'X residual (pixels)'),
-            (y_map, 'Y PPE', 'Y residual (pixels)'),
-        )
-        extent = (0.0, 1.0, 0.0, 1.0)
-
-        for ax, (data, title, cbar_label) in zip(axes, map_data):
-            im = ax.imshow(data, origin='lower', extent=extent,
-                           cmap='coolwarm', aspect='equal')
-            ax.set_title(title)
-            ax.set_xlabel('Subpixel x phase')
-            ax.set_ylabel('Subpixel y phase')
-            fig.colorbar(im, ax=ax, label=cbar_label)
-
-        return fig
